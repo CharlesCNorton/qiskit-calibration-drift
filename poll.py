@@ -272,6 +272,11 @@ def extract_calibration(service, env_data):
                 for prop_name, (value, cal_time) in qprops.items():
                     if prop_name == "readout_length":
                         continue
+                    # Calculate solar zenith at calibration time, not observation time
+                    cal_dt = dateparser.parse(str(cal_time))
+                    if cal_dt.tzinfo is None:
+                        cal_dt = cal_dt.replace(tzinfo=timezone.utc)
+                    cal_zenith = solar_zenith(lat, lon, cal_dt) if lat else None
                     records.append({
                         "backend": name,
                         "qubit": q,
@@ -282,7 +287,7 @@ def extract_calibration(service, env_data):
                         "location": location,
                         "latitude": lat,
                         "longitude": lon,
-                        "solar_zenith_deg": zenith,
+                        "solar_zenith_deg": cal_zenith,
                         "temperature_c": weather.get("temperature_c"),
                         "pressure_hpa": weather.get("pressure_hpa"),
                         "humidity_pct": weather.get("humidity_pct"),
@@ -305,6 +310,11 @@ def extract_calibration(service, env_data):
 
         # SX gate errors
         sx_count = 0
+        sx_cal_time = props.last_update_date
+        sx_cal_dt = dateparser.parse(str(sx_cal_time))
+        if sx_cal_dt.tzinfo is None:
+            sx_cal_dt = sx_cal_dt.replace(tzinfo=timezone.utc)
+        sx_zenith = solar_zenith(lat, lon, sx_cal_dt) if lat else None
         for q in range(config.n_qubits):
             try:
                 sx_err = props.gate_error("sx", q)
@@ -313,12 +323,12 @@ def extract_calibration(service, env_data):
                     "qubit": q,
                     "property": "sx_error",
                     "value": float(sx_err) if sx_err is not None else None,
-                    "calibrated_time": normalize_timestamp(props.last_update_date),
+                    "calibrated_time": normalize_timestamp(sx_cal_time),
                     "observed_time": observed_time,
                     "location": location,
                     "latitude": lat,
                     "longitude": lon,
-                    "solar_zenith_deg": zenith,
+                    "solar_zenith_deg": sx_zenith,
                     "temperature_c": weather.get("temperature_c"),
                     "pressure_hpa": weather.get("pressure_hpa"),
                     "humidity_pct": weather.get("humidity_pct"),
@@ -336,6 +346,8 @@ def extract_calibration(service, env_data):
 
         edge_count = 0
         edge_errors = 0
+        # CZ uses same calibration time as SX
+        cz_zenith = sx_zenith
         for edge in config.coupling_map:
             try:
                 err = props.gate_error("cz", edge)
@@ -349,7 +361,7 @@ def extract_calibration(service, env_data):
                     "location": location,
                     "latitude": lat,
                     "longitude": lon,
-                    "solar_zenith_deg": zenith,
+                    "solar_zenith_deg": cz_zenith,
                     "temperature_c": weather.get("temperature_c"),
                     "pressure_hpa": weather.get("pressure_hpa"),
                     "humidity_pct": weather.get("humidity_pct"),
