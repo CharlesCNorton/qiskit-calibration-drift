@@ -2,16 +2,28 @@
 IBM Quantum Calibration Data Collector
 
 Extracts calibration parameters from IBM Quantum backends and appends
-new measurements to a HuggingFace dataset. Designed for scheduled execution.
+new measurements to a HuggingFace dataset. Includes environmental data
+(weather, space weather) for correlation analysis.
 """
 
 import os
 import sys
+import json
+import urllib.request
 from datetime import datetime, timezone
 from dateutil import parser as dateparser
 
 
 REPO_ID = "phanerozoic/qiskit-calibration-drift"
+
+# IBM Quantum Data Center locations
+LOCATIONS = {
+    "yorktown_heights_ny": {
+        "lat": 41.27,
+        "lon": -73.78,
+        "backends": ["ibm_torino", "ibm_fez", "ibm_marrakesh"]
+    }
+}
 
 
 def log(msg):
@@ -29,6 +41,81 @@ def normalize_timestamp(ts_str):
     except Exception as e:
         log(f"Warning: Could not parse timestamp '{ts_str}': {e}")
         return str(ts_str)
+
+
+def get_space_weather():
+    """Fetch current space weather data from NOAA SWPC."""
+    log("Fetching space weather data...")
+    data = {"kp_index": None, "solar_flux": None}
+
+    # Kp index
+    try:
+        url = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            kp_data = json.loads(resp.read())
+            if len(kp_data) > 1:
+                latest = kp_data[-1]
+                data["kp_index"] = float(latest[1])
+                log(f"  Kp index: {data['kp_index']}")
+    except Exception as e:
+        log(f"  Warning: Could not fetch Kp index: {e}")
+
+    # Solar flux (10.7cm)
+    try:
+        url = "https://services.swpc.noaa.gov/products/summary/10cm-flux.json"
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            flux_data = json.loads(resp.read())
+            data["solar_flux"] = float(flux_data.get("Flux", 0))
+            log(f"  Solar flux: {data['solar_flux']} SFU")
+    except Exception as e:
+        log(f"  Warning: Could not fetch solar flux: {e}")
+
+    return data
+
+
+def get_weather(lat, lon):
+    """Fetch current weather from NWS API."""
+    log(f"Fetching weather for ({lat}, {lon})...")
+    data = {"temperature_c": None, "pressure_hpa": None, "humidity_pct": None}
+
+    try:
+        # Get grid point
+        url = f"https://api.weather.gov/points/{lat},{lon}"
+        req = urllib.request.Request(url, headers={"User-Agent": "qiskit-calibration-drift"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            point_data = json.loads(resp.read())
+            stations_url = point_data["properties"]["observationStations"]
+
+        # Get nearest station
+        req = urllib.request.Request(stations_url, headers={"User-Agent": "qiskit-calibration-drift"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            stations_data = json.loads(resp.read())
+            station_id = stations_data["features"][0]["properties"]["stationIdentifier"]
+
+        # Get latest observation
+        obs_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
+        req = urllib.request.Request(obs_url, headers={"User-Agent": "qiskit-calibration-drift"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            obs_data = json.loads(resp.read())
+            props = obs_data["properties"]
+
+            if props.get("temperature", {}).get("value") is not None:
+                data["temperature_c"] = round(props["temperature"]["value"], 2)
+
+            if props.get("barometricPressure", {}).get("value") is not None:
+                data["pressure_hpa"] = round(props["barometricPressure"]["value"] / 100, 2)
+
+            if props.get("relativeHumidity", {}).get("value") is not None:
+                data["humidity_pct"] = round(props["relativeHumidity"]["value"], 2)
+
+        log(f"  Temperature: {data['temperature_c']}°C")
+        log(f"  Pressure: {data['pressure_hpa']} hPa")
+        log(f"  Humidity: {data['humidity_pct']}%")
+
+    except Exception as e:
+        log(f"  Warning: Could not fetch weather: {e}")
+
+    return data
 
 
 def get_existing_keys():
@@ -72,7 +159,15 @@ def connect_ibm():
         raise
 
 
-def extract_calibration(service):
+def get_location_for_backend(backend_name):
+    """Return location info for a backend."""
+    for loc_name, loc_info in LOCATIONS.items():
+        if backend_name in loc_info["backends"]:
+            return loc_name, loc_info["lat"], loc_info["lon"]
+    return "unknown", None, None
+
+
+def extract_calibration(service, env_data):
     """Extract current calibration data from all available backends."""
     log("Fetching backend list...")
     try:
@@ -90,6 +185,8 @@ def extract_calibration(service):
         name = backend.name
         log(f"Processing {name}...")
 
+        location, lat, lon = get_location_for_backend(name)
+
         try:
             props = backend.properties()
             config = backend.configuration()
@@ -97,6 +194,13 @@ def extract_calibration(service):
             log(f"  Error: Failed to get properties for {name}: {e}")
             errors.append((name, "properties", str(e)))
             continue
+
+        # Get weather for this location if we haven't already
+        weather_key = f"{lat},{lon}"
+        if weather_key not in env_data["weather_cache"] and lat is not None:
+            env_data["weather_cache"][weather_key] = get_weather(lat, lon)
+
+        weather = env_data["weather_cache"].get(weather_key, {})
 
         qubit_count = 0
         qubit_errors = 0
@@ -113,6 +217,14 @@ def extract_calibration(service):
                         "value": float(value) if value is not None else None,
                         "calibrated_time": normalize_timestamp(cal_time),
                         "observed_time": observed_time,
+                        "location": location,
+                        "latitude": lat,
+                        "longitude": lon,
+                        "temperature_c": weather.get("temperature_c"),
+                        "pressure_hpa": weather.get("pressure_hpa"),
+                        "humidity_pct": weather.get("humidity_pct"),
+                        "kp_index": env_data["space"].get("kp_index"),
+                        "solar_flux_sfu": env_data["space"].get("solar_flux"),
                     })
                 qubit_count += 1
             except Exception as e:
@@ -137,6 +249,14 @@ def extract_calibration(service):
                     "value": float(err) if err is not None else None,
                     "calibrated_time": normalize_timestamp(props.last_update_date),
                     "observed_time": observed_time,
+                    "location": location,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "temperature_c": weather.get("temperature_c"),
+                    "pressure_hpa": weather.get("pressure_hpa"),
+                    "humidity_pct": weather.get("humidity_pct"),
+                    "kp_index": env_data["space"].get("kp_index"),
+                    "solar_flux_sfu": env_data["space"].get("solar_flux"),
                 })
                 edge_count += 1
             except Exception:
@@ -182,10 +302,16 @@ def upload_records(new_records):
 
 
 def main():
-    log("=" * 50)
-    log("IBM Quantum Calibration Poller")
+    log("=" * 60)
+    log("IBM Quantum Calibration Poller (with Environmental Data)")
     log(f"Target dataset: {REPO_ID}")
-    log("=" * 50)
+    log("=" * 60)
+
+    # Collect environmental data first
+    env_data = {
+        "space": get_space_weather(),
+        "weather_cache": {}
+    }
 
     try:
         existing_keys = get_existing_keys()
@@ -200,7 +326,7 @@ def main():
         sys.exit(1)
 
     try:
-        records = extract_calibration(service)
+        records = extract_calibration(service, env_data)
     except Exception as e:
         log(f"Fatal: Extraction failed: {e}")
         sys.exit(1)
@@ -223,9 +349,9 @@ def main():
         log(f"Fatal: Upload failed: {e}")
         sys.exit(1)
 
-    log("=" * 50)
+    log("=" * 60)
     log(f"Successfully uploaded {len(new_records)} new records.")
-    log("=" * 50)
+    log("=" * 60)
 
 
 if __name__ == "__main__":
