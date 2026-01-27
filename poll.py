@@ -9,6 +9,7 @@ new measurements to a HuggingFace dataset. Includes environmental data
 import os
 import sys
 import json
+import math
 import urllib.request
 from datetime import datetime, timezone
 from dateutil import parser as dateparser
@@ -41,6 +42,22 @@ def normalize_timestamp(ts_str):
     except Exception as e:
         log(f"Warning: Could not parse timestamp '{ts_str}': {e}")
         return str(ts_str)
+
+
+def solar_zenith(lat, lon, dt):
+    """Calculate solar zenith angle in degrees. >90 = night."""
+    doy = dt.timetuple().tm_yday
+    hour = dt.hour + dt.minute / 60 + dt.second / 3600
+    decl = -23.45 * math.cos(math.radians(360 / 365 * (doy + 10)))
+    solar_noon = 12 - lon / 15
+    hour_angle = 15 * (hour - solar_noon)
+    lat_rad = math.radians(lat)
+    decl_rad = math.radians(decl)
+    hour_rad = math.radians(hour_angle)
+    cos_zenith = (math.sin(lat_rad) * math.sin(decl_rad) +
+                  math.cos(lat_rad) * math.cos(decl_rad) * math.cos(hour_rad))
+    zenith = math.degrees(math.acos(max(-1, min(1, cos_zenith))))
+    return round(zenith, 2)
 
 
 def get_space_weather():
@@ -220,7 +237,8 @@ def extract_calibration(service, env_data):
         log(f"Error: Failed to fetch backends: {e}")
         raise
 
-    observed_time = datetime.now(timezone.utc).isoformat()
+    obs_dt = datetime.now(timezone.utc)
+    observed_time = obs_dt.isoformat()
     records = []
     errors = []
 
@@ -229,6 +247,7 @@ def extract_calibration(service, env_data):
         log(f"Processing {name}...")
 
         location, lat, lon = get_location_for_backend(name)
+        zenith = solar_zenith(lat, lon, obs_dt) if lat else None
 
         try:
             props = backend.properties()
@@ -263,6 +282,7 @@ def extract_calibration(service, env_data):
                         "location": location,
                         "latitude": lat,
                         "longitude": lon,
+                        "solar_zenith_deg": zenith,
                         "temperature_c": weather.get("temperature_c"),
                         "pressure_hpa": weather.get("pressure_hpa"),
                         "humidity_pct": weather.get("humidity_pct"),
@@ -283,6 +303,37 @@ def extract_calibration(service, env_data):
 
         log(f"  Qubits processed: {qubit_count}/{config.n_qubits}")
 
+        # SX gate errors
+        sx_count = 0
+        for q in range(config.n_qubits):
+            try:
+                sx_err = props.gate_error("sx", q)
+                records.append({
+                    "backend": name,
+                    "qubit": q,
+                    "property": "sx_error",
+                    "value": float(sx_err) if sx_err is not None else None,
+                    "calibrated_time": normalize_timestamp(props.last_update_date),
+                    "observed_time": observed_time,
+                    "location": location,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "solar_zenith_deg": zenith,
+                    "temperature_c": weather.get("temperature_c"),
+                    "pressure_hpa": weather.get("pressure_hpa"),
+                    "humidity_pct": weather.get("humidity_pct"),
+                    "kp_index": env_data["space"].get("kp_index"),
+                    "solar_flux_sfu": env_data["space"].get("solar_flux"),
+                    "dst_nt": env_data["space"].get("dst_nt"),
+                    "bz_gsm_nt": env_data["space"].get("bz_gsm_nt"),
+                    "neutron_flux": env_data["space"].get("neutron_flux"),
+                })
+                sx_count += 1
+            except Exception:
+                pass
+
+        log(f"  SX gates processed: {sx_count}/{config.n_qubits}")
+
         edge_count = 0
         edge_errors = 0
         for edge in config.coupling_map:
@@ -298,6 +349,7 @@ def extract_calibration(service, env_data):
                     "location": location,
                     "latitude": lat,
                     "longitude": lon,
+                    "solar_zenith_deg": zenith,
                     "temperature_c": weather.get("temperature_c"),
                     "pressure_hpa": weather.get("pressure_hpa"),
                     "humidity_pct": weather.get("humidity_pct"),
