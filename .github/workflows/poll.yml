@@ -1,26 +1,26 @@
 name: Poll IBM Quantum Calibration
 
-  on:
-    schedule:
-      - cron: '*/30 * * * *'
-    workflow_dispatch:
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
 
-  jobs:
-    poll:
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v4
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-        - name: Set up Python
-          uses: actions/setup-python@v5
-          with:
-            python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-        - name: Install dependencies
-          run: pip install qiskit-ibm-runtime datasets huggingface_hub
+      - name: Install dependencies
+        run: pip install qiskit-ibm-runtime datasets huggingface_hub
 
-        - name: Run poller
-          env:
-            IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
-            HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          run: python poll.py
+      - name: Run poller
+        env:
+          IBM_QUANTUM_TOKEN: ${{ secrets.IBM_QUANTUM_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python poll.py
