@@ -12,13 +12,14 @@ Automated collection of IBM Quantum hardware calibration data with environmental
 |-------|------|-------------|
 | `backend` | string | Backend name (ibm_torino, ibm_fez, ibm_marrakesh) |
 | `qubit` | int | Qubit index (-1 for two-qubit gate data) |
-| `property` | string | T1, T2, readout_error, prob_meas0_prep1, prob_meas1_prep0, cz_error_i_j |
+| `property` | string | T1, T2, readout_error, prob_meas0_prep1, prob_meas1_prep0, sx_error, cz_error_i_j |
 | `value` | float | Measured value |
 | `calibrated_time` | string | IBM calibration timestamp (UTC) |
 | `observed_time` | string | Collection timestamp (UTC) |
 | `location` | string | Data center location |
 | `latitude` | float | Data center latitude |
 | `longitude` | float | Data center longitude |
+| `solar_zenith_deg` | float | Solar zenith angle (>90 = night) |
 | `temperature_c` | float | Local temperature (°C) |
 | `pressure_hpa` | float | Barometric pressure (hPa) |
 | `humidity_pct` | float | Relative humidity (%) |
