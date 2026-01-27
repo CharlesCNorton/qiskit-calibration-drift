@@ -44,9 +44,16 @@ def normalize_timestamp(ts_str):
 
 
 def get_space_weather():
-    """Fetch current space weather data from NOAA SWPC."""
+    """Fetch current space weather data from NOAA SWPC and NMDB."""
+    import re
     log("Fetching space weather data...")
-    data = {"kp_index": None, "solar_flux": None}
+    data = {
+        "kp_index": None,
+        "solar_flux": None,
+        "dst_nt": None,
+        "bz_gsm_nt": None,
+        "neutron_flux": None
+    }
 
     # Kp index
     try:
@@ -69,6 +76,42 @@ def get_space_weather():
             log(f"  Solar flux: {data['solar_flux']} SFU")
     except Exception as e:
         log(f"  Warning: Could not fetch solar flux: {e}")
+
+    # Dst index (ring current)
+    try:
+        url = "https://services.swpc.noaa.gov/products/kyoto-dst.json"
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            dst_data = json.loads(resp.read())
+            if len(dst_data) > 1:
+                latest = dst_data[-1]
+                data["dst_nt"] = float(latest[1])
+                log(f"  Dst index: {data['dst_nt']} nT")
+    except Exception as e:
+        log(f"  Warning: Could not fetch Dst index: {e}")
+
+    # Solar wind Bz (IMF z-component)
+    try:
+        url = "https://services.swpc.noaa.gov/products/summary/solar-wind-mag-field.json"
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            bz_data = json.loads(resp.read())
+            data["bz_gsm_nt"] = float(bz_data.get("Bz", 0))
+            log(f"  Bz GSM: {data['bz_gsm_nt']} nT")
+    except Exception as e:
+        log(f"  Warning: Could not fetch Bz: {e}")
+
+    # Neutron monitor (NMDB Newark - closest to Yorktown Heights, NY)
+    try:
+        url = "https://www.nmdb.eu/nest/draw_graph.php?formchk=1&stations[]=NEWK&tabchoice=revori&dtype=corr_for_pressure&tresolution=60&force=1&output=ascii&date_choice=last"
+        req = urllib.request.Request(url, headers={"User-Agent": "qiskit-calibration-drift"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            nmdb_data = resp.read().decode("utf-8")
+            pattern = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2});\s*([\d.]+)"
+            matches = re.findall(pattern, nmdb_data)
+            if matches:
+                data["neutron_flux"] = float(matches[-1][1])
+                log(f"  Neutron flux: {data['neutron_flux']}")
+    except Exception as e:
+        log(f"  Warning: Could not fetch neutron flux: {e}")
 
     return data
 
@@ -225,6 +268,9 @@ def extract_calibration(service, env_data):
                         "humidity_pct": weather.get("humidity_pct"),
                         "kp_index": env_data["space"].get("kp_index"),
                         "solar_flux_sfu": env_data["space"].get("solar_flux"),
+                        "dst_nt": env_data["space"].get("dst_nt"),
+                        "bz_gsm_nt": env_data["space"].get("bz_gsm_nt"),
+                        "neutron_flux": env_data["space"].get("neutron_flux"),
                     })
                 qubit_count += 1
             except Exception as e:
@@ -257,6 +303,9 @@ def extract_calibration(service, env_data):
                     "humidity_pct": weather.get("humidity_pct"),
                     "kp_index": env_data["space"].get("kp_index"),
                     "solar_flux_sfu": env_data["space"].get("solar_flux"),
+                    "dst_nt": env_data["space"].get("dst_nt"),
+                    "bz_gsm_nt": env_data["space"].get("bz_gsm_nt"),
+                    "neutron_flux": env_data["space"].get("neutron_flux"),
                 })
                 edge_count += 1
             except Exception:
