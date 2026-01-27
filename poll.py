@@ -3,45 +3,52 @@ IBM Quantum Calibration Data Collector
 
 Extracts calibration parameters from IBM Quantum backends and appends
 new measurements to a HuggingFace dataset. Includes environmental data
-(weather, space weather) for correlation analysis.
+(weather, space weather) matched to calibration timestamps.
 """
 
 import os
 import sys
 import json
 import math
+import re
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil import parser as dateparser
 
 
 REPO_ID = "phanerozoic/qiskit-calibration-drift"
 
-# IBM Quantum Data Center locations
 LOCATIONS = {
     "yorktown_heights_ny": {
         "lat": 41.27,
         "lon": -73.78,
-        "backends": ["ibm_torino", "ibm_fez", "ibm_marrakesh"]
+        "backends": ["ibm_torino", "ibm_fez", "ibm_marrakesh"],
+        "weather_station": "KHPN"
     }
 }
 
 
 def log(msg):
-    """Print timestamped log message."""
     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
 
 
-def normalize_timestamp(ts_str):
-    """Convert any timestamp string to UTC ISO format for consistent comparison."""
+def parse_timestamp(ts_str):
+    """Parse timestamp string to datetime object."""
     try:
         dt = dateparser.parse(str(ts_str))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception as e:
-        log(f"Warning: Could not parse timestamp '{ts_str}': {e}")
-        return str(ts_str)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def normalize_timestamp(ts_str):
+    """Convert timestamp to standard string format."""
+    dt = parse_timestamp(ts_str)
+    if dt:
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return str(ts_str)
 
 
 def solar_zenith(lat, lon, dt):
@@ -60,126 +67,185 @@ def solar_zenith(lat, lon, dt):
     return round(zenith, 2)
 
 
-def get_space_weather():
-    """Fetch current space weather data from NOAA SWPC and NMDB."""
-    import re
-    log("Fetching space weather data...")
-    data = {
-        "kp_index": None,
-        "solar_flux": None,
-        "dst_nt": None,
-        "bz_gsm_nt": None,
-        "neutron_flux": None
-    }
+def find_closest(history, target_dt, max_hours=48):
+    """Find closest historical value to target datetime."""
+    if not history or not target_dt:
+        return None
 
-    # Kp index
+    best_match = None
+    best_diff = timedelta(hours=max_hours)
+
+    for ts, value in history:
+        diff = abs(ts - target_dt)
+        if diff < best_diff:
+            best_diff = diff
+            best_match = value
+
+    return best_match
+
+
+def fetch_kp_history():
+    """Fetch Kp index history (30 days available)."""
+    log("  Fetching Kp history...")
+    history = []
     try:
         url = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            kp_data = json.loads(resp.read())
-            if len(kp_data) > 1:
-                latest = kp_data[-1]
-                data["kp_index"] = float(latest[1])
-                log(f"  Kp index: {data['kp_index']}")
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read())
+            for row in data[1:]:
+                ts = parse_timestamp(row[0])
+                if ts:
+                    history.append((ts, float(row[1])))
+        log(f"    Got {len(history)} Kp records")
     except Exception as e:
-        log(f"  Warning: Could not fetch Kp index: {e}")
+        log(f"    Warning: Kp fetch failed: {e}")
+    return history
 
-    # Solar flux (10.7cm)
+
+def fetch_dst_history():
+    """Fetch Dst index history."""
+    log("  Fetching Dst history...")
+    history = []
+    try:
+        url = "https://services.swpc.noaa.gov/products/kyoto-dst.json"
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read())
+            for row in data[1:]:
+                ts = parse_timestamp(row[0])
+                if ts:
+                    history.append((ts, float(row[1])))
+        log(f"    Got {len(history)} Dst records")
+    except Exception as e:
+        log(f"    Warning: Dst fetch failed: {e}")
+    return history
+
+
+def fetch_bz_history():
+    """Fetch Bz IMF history (7 days)."""
+    log("  Fetching Bz history...")
+    history = []
+    try:
+        url = "https://services.swpc.noaa.gov/products/solar-wind/mag-7-day.json"
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read())
+            for row in data[1:]:
+                ts = parse_timestamp(row[0])
+                if ts and row[3] is not None:
+                    history.append((ts, float(row[3])))
+        log(f"    Got {len(history)} Bz records")
+    except Exception as e:
+        log(f"    Warning: Bz fetch failed: {e}")
+    return history
+
+
+def fetch_solar_flux_history():
+    """Fetch solar flux (current value only, updates daily)."""
+    log("  Fetching solar flux...")
     try:
         url = "https://services.swpc.noaa.gov/products/summary/10cm-flux.json"
         with urllib.request.urlopen(url, timeout=15) as resp:
-            flux_data = json.loads(resp.read())
-            data["solar_flux"] = float(flux_data.get("Flux", 0))
-            log(f"  Solar flux: {data['solar_flux']} SFU")
+            data = json.loads(resp.read())
+            flux = float(data.get("Flux", 0))
+            log(f"    Solar flux: {flux} SFU")
+            return flux
     except Exception as e:
-        log(f"  Warning: Could not fetch solar flux: {e}")
+        log(f"    Warning: Solar flux fetch failed: {e}")
+        return None
 
-    # Dst index (ring current)
-    try:
-        url = "https://services.swpc.noaa.gov/products/kyoto-dst.json"
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            dst_data = json.loads(resp.read())
-            if len(dst_data) > 1:
-                latest = dst_data[-1]
-                data["dst_nt"] = float(latest[1])
-                log(f"  Dst index: {data['dst_nt']} nT")
-    except Exception as e:
-        log(f"  Warning: Could not fetch Dst index: {e}")
 
-    # Solar wind Bz (IMF z-component)
+def fetch_neutron_history():
+    """Fetch neutron monitor history (last 48 hours)."""
+    log("  Fetching neutron history...")
+    history = []
     try:
-        url = "https://services.swpc.noaa.gov/products/summary/solar-wind-mag-field.json"
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            bz_data = json.loads(resp.read())
-            data["bz_gsm_nt"] = float(bz_data.get("Bz", 0))
-            log(f"  Bz GSM: {data['bz_gsm_nt']} nT")
-    except Exception as e:
-        log(f"  Warning: Could not fetch Bz: {e}")
-
-    # Neutron monitor (NMDB Newark - closest to Yorktown Heights, NY)
-    try:
-        url = "https://www.nmdb.eu/nest/draw_graph.php?formchk=1&stations[]=NEWK&tabchoice=revori&dtype=corr_for_pressure&tresolution=60&force=1&output=ascii&date_choice=last"
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(hours=48)
+        url = (f"https://www.nmdb.eu/nest/draw_graph.php?formchk=1&stations[]=NEWK"
+               f"&tabchoice=revori&dtype=corr_for_pressure&tresolution=60"
+               f"&date_choice=bydate"
+               f"&start_year={start.year}&start_month={start.month:02d}"
+               f"&start_day={start.day:02d}&start_hour=0&start_min=0"
+               f"&end_year={now.year}&end_month={now.month:02d}"
+               f"&end_day={now.day:02d}&end_hour=23&end_min=59"
+               f"&output=ascii")
         req = urllib.request.Request(url, headers={"User-Agent": "qiskit-calibration-drift"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            nmdb_data = resp.read().decode("utf-8")
+            data = resp.read().decode("utf-8")
             pattern = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2});\s*([\d.]+)"
-            matches = re.findall(pattern, nmdb_data)
-            if matches:
-                data["neutron_flux"] = float(matches[-1][1])
-                log(f"  Neutron flux: {data['neutron_flux']}")
+            matches = re.findall(pattern, data)
+            for ts_str, val in matches:
+                ts = parse_timestamp(ts_str)
+                if ts:
+                    history.append((ts, float(val)))
+        log(f"    Got {len(history)} neutron records")
     except Exception as e:
-        log(f"  Warning: Could not fetch neutron flux: {e}")
+        log(f"    Warning: Neutron fetch failed: {e}")
+    return history
 
-    return data
 
-
-def get_weather(lat, lon):
-    """Fetch current weather from NWS API."""
-    log(f"Fetching weather for ({lat}, {lon})...")
-    data = {"temperature_c": None, "pressure_hpa": None, "humidity_pct": None}
-
+def fetch_weather_history(station):
+    """Fetch weather observation history."""
+    log(f"  Fetching weather history ({station})...")
+    history = []
     try:
-        # Get grid point
-        url = f"https://api.weather.gov/points/{lat},{lon}"
+        url = f"https://api.weather.gov/stations/{station}/observations"
         req = urllib.request.Request(url, headers={"User-Agent": "qiskit-calibration-drift"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            point_data = json.loads(resp.read())
-            stations_url = point_data["properties"]["observationStations"]
-
-        # Get nearest station
-        req = urllib.request.Request(stations_url, headers={"User-Agent": "qiskit-calibration-drift"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            stations_data = json.loads(resp.read())
-            station_id = stations_data["features"][0]["properties"]["stationIdentifier"]
-
-        # Get latest observation
-        obs_url = f"https://api.weather.gov/stations/{station_id}/observations/latest"
-        req = urllib.request.Request(obs_url, headers={"User-Agent": "qiskit-calibration-drift"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            obs_data = json.loads(resp.read())
-            props = obs_data["properties"]
-
-            if props.get("temperature", {}).get("value") is not None:
-                data["temperature_c"] = round(props["temperature"]["value"], 2)
-
-            if props.get("barometricPressure", {}).get("value") is not None:
-                data["pressure_hpa"] = round(props["barometricPressure"]["value"] / 100, 2)
-
-            if props.get("relativeHumidity", {}).get("value") is not None:
-                data["humidity_pct"] = round(props["relativeHumidity"]["value"], 2)
-
-        log(f"  Temperature: {data['temperature_c']}°C")
-        log(f"  Pressure: {data['pressure_hpa']} hPa")
-        log(f"  Humidity: {data['humidity_pct']}%")
-
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            for feature in data.get("features", []):
+                props = feature.get("properties", {})
+                ts = parse_timestamp(props.get("timestamp"))
+                if ts:
+                    temp = props.get("temperature", {}).get("value")
+                    pres = props.get("barometricPressure", {}).get("value")
+                    hum = props.get("relativeHumidity", {}).get("value")
+                    history.append((ts, {
+                        "temperature_c": round(temp, 2) if temp is not None else None,
+                        "pressure_hpa": round(pres / 100, 2) if pres is not None else None,
+                        "humidity_pct": round(hum, 2) if hum is not None else None
+                    }))
+        log(f"    Got {len(history)} weather records")
     except Exception as e:
-        log(f"  Warning: Could not fetch weather: {e}")
+        log(f"    Warning: Weather fetch failed: {e}")
+    return history
 
-    return data
+
+def fetch_environmental_history():
+    """Fetch all environmental data history."""
+    log("Fetching environmental history (48h)...")
+    return {
+        "kp": fetch_kp_history(),
+        "dst": fetch_dst_history(),
+        "bz": fetch_bz_history(),
+        "solar_flux": fetch_solar_flux_history(),
+        "neutron": fetch_neutron_history(),
+        "weather": {}
+    }
+
+
+def get_env_for_time(env_history, cal_dt, lat, lon, weather_station):
+    """Get environmental data for a specific calibration time."""
+    if weather_station not in env_history["weather"]:
+        env_history["weather"][weather_station] = fetch_weather_history(weather_station)
+
+    weather_match = find_closest(env_history["weather"][weather_station], cal_dt)
+    weather = weather_match if weather_match else {}
+
+    return {
+        "solar_zenith_deg": solar_zenith(lat, lon, cal_dt) if cal_dt and lat else None,
+        "temperature_c": weather.get("temperature_c"),
+        "pressure_hpa": weather.get("pressure_hpa"),
+        "humidity_pct": weather.get("humidity_pct"),
+        "kp_index": find_closest(env_history["kp"], cal_dt),
+        "solar_flux_sfu": env_history["solar_flux"],
+        "dst_nt": find_closest(env_history["dst"], cal_dt),
+        "bz_gsm_nt": find_closest(env_history["bz"], cal_dt),
+        "neutron_flux": find_closest(env_history["neutron"], cal_dt),
+    }
 
 
 def get_existing_keys():
-    """Return set of (backend, qubit, property, calibrated_time) already in dataset."""
+    """Return set of existing record keys."""
     log("Loading existing dataset from HuggingFace...")
     try:
         from datasets import load_dataset
@@ -223,12 +289,12 @@ def get_location_for_backend(backend_name):
     """Return location info for a backend."""
     for loc_name, loc_info in LOCATIONS.items():
         if backend_name in loc_info["backends"]:
-            return loc_name, loc_info["lat"], loc_info["lon"]
-    return "unknown", None, None
+            return loc_name, loc_info["lat"], loc_info["lon"], loc_info["weather_station"]
+    return "unknown", None, None, None
 
 
-def extract_calibration(service, env_data):
-    """Extract current calibration data from all available backends."""
+def extract_calibration(service, env_history):
+    """Extract calibration data with matched environmental data."""
     log("Fetching backend list...")
     try:
         backends = service.backends()
@@ -237,8 +303,7 @@ def extract_calibration(service, env_data):
         log(f"Error: Failed to fetch backends: {e}")
         raise
 
-    obs_dt = datetime.now(timezone.utc)
-    observed_time = obs_dt.isoformat()
+    observed_time = datetime.now(timezone.utc).isoformat()
     records = []
     errors = []
 
@@ -246,8 +311,7 @@ def extract_calibration(service, env_data):
         name = backend.name
         log(f"Processing {name}...")
 
-        location, lat, lon = get_location_for_backend(name)
-        zenith = solar_zenith(lat, lon, obs_dt) if lat else None
+        location, lat, lon, weather_station = get_location_for_backend(name)
 
         try:
             props = backend.properties()
@@ -257,13 +321,6 @@ def extract_calibration(service, env_data):
             errors.append((name, "properties", str(e)))
             continue
 
-        # Get weather for this location if we haven't already
-        weather_key = f"{lat},{lon}"
-        if weather_key not in env_data["weather_cache"] and lat is not None:
-            env_data["weather_cache"][weather_key] = get_weather(lat, lon)
-
-        weather = env_data["weather_cache"].get(weather_key, {})
-
         qubit_count = 0
         qubit_errors = 0
         for q in range(config.n_qubits):
@@ -272,11 +329,10 @@ def extract_calibration(service, env_data):
                 for prop_name, (value, cal_time) in qprops.items():
                     if prop_name == "readout_length":
                         continue
-                    # Calculate solar zenith at calibration time, not observation time
-                    cal_dt = dateparser.parse(str(cal_time))
-                    if cal_dt.tzinfo is None:
-                        cal_dt = cal_dt.replace(tzinfo=timezone.utc)
-                    cal_zenith = solar_zenith(lat, lon, cal_dt) if lat else None
+
+                    cal_dt = parse_timestamp(cal_time)
+                    env = get_env_for_time(env_history, cal_dt, lat, lon, weather_station)
+
                     records.append({
                         "backend": name,
                         "qubit": q,
@@ -287,15 +343,7 @@ def extract_calibration(service, env_data):
                         "location": location,
                         "latitude": lat,
                         "longitude": lon,
-                        "solar_zenith_deg": cal_zenith,
-                        "temperature_c": weather.get("temperature_c"),
-                        "pressure_hpa": weather.get("pressure_hpa"),
-                        "humidity_pct": weather.get("humidity_pct"),
-                        "kp_index": env_data["space"].get("kp_index"),
-                        "solar_flux_sfu": env_data["space"].get("solar_flux"),
-                        "dst_nt": env_data["space"].get("dst_nt"),
-                        "bz_gsm_nt": env_data["space"].get("bz_gsm_nt"),
-                        "neutron_flux": env_data["space"].get("neutron_flux"),
+                        **env
                     })
                 qubit_count += 1
             except Exception as e:
@@ -308,35 +356,24 @@ def extract_calibration(service, env_data):
 
         log(f"  Qubits processed: {qubit_count}/{config.n_qubits}")
 
-        # SX gate errors
         sx_count = 0
-        sx_cal_time = props.last_update_date
-        sx_cal_dt = dateparser.parse(str(sx_cal_time))
-        if sx_cal_dt.tzinfo is None:
-            sx_cal_dt = sx_cal_dt.replace(tzinfo=timezone.utc)
-        sx_zenith = solar_zenith(lat, lon, sx_cal_dt) if lat else None
         for q in range(config.n_qubits):
             try:
                 sx_err = props.gate_error("sx", q)
+                cal_dt = parse_timestamp(props.last_update_date)
+                env = get_env_for_time(env_history, cal_dt, lat, lon, weather_station)
+
                 records.append({
                     "backend": name,
                     "qubit": q,
                     "property": "sx_error",
                     "value": float(sx_err) if sx_err is not None else None,
-                    "calibrated_time": normalize_timestamp(sx_cal_time),
+                    "calibrated_time": normalize_timestamp(props.last_update_date),
                     "observed_time": observed_time,
                     "location": location,
                     "latitude": lat,
                     "longitude": lon,
-                    "solar_zenith_deg": sx_zenith,
-                    "temperature_c": weather.get("temperature_c"),
-                    "pressure_hpa": weather.get("pressure_hpa"),
-                    "humidity_pct": weather.get("humidity_pct"),
-                    "kp_index": env_data["space"].get("kp_index"),
-                    "solar_flux_sfu": env_data["space"].get("solar_flux"),
-                    "dst_nt": env_data["space"].get("dst_nt"),
-                    "bz_gsm_nt": env_data["space"].get("bz_gsm_nt"),
-                    "neutron_flux": env_data["space"].get("neutron_flux"),
+                    **env
                 })
                 sx_count += 1
             except Exception:
@@ -346,11 +383,12 @@ def extract_calibration(service, env_data):
 
         edge_count = 0
         edge_errors = 0
-        # CZ uses same calibration time as SX
-        cz_zenith = sx_zenith
         for edge in config.coupling_map:
             try:
                 err = props.gate_error("cz", edge)
+                cal_dt = parse_timestamp(props.last_update_date)
+                env = get_env_for_time(env_history, cal_dt, lat, lon, weather_station)
+
                 records.append({
                     "backend": name,
                     "qubit": -1,
@@ -361,15 +399,7 @@ def extract_calibration(service, env_data):
                     "location": location,
                     "latitude": lat,
                     "longitude": lon,
-                    "solar_zenith_deg": cz_zenith,
-                    "temperature_c": weather.get("temperature_c"),
-                    "pressure_hpa": weather.get("pressure_hpa"),
-                    "humidity_pct": weather.get("humidity_pct"),
-                    "kp_index": env_data["space"].get("kp_index"),
-                    "solar_flux_sfu": env_data["space"].get("solar_flux"),
-                    "dst_nt": env_data["space"].get("dst_nt"),
-                    "bz_gsm_nt": env_data["space"].get("bz_gsm_nt"),
-                    "neutron_flux": env_data["space"].get("neutron_flux"),
+                    **env
                 })
                 edge_count += 1
             except Exception:
@@ -416,15 +446,11 @@ def upload_records(new_records):
 
 def main():
     log("=" * 60)
-    log("IBM Quantum Calibration Poller (with Environmental Data)")
+    log("IBM Quantum Calibration Poller (with Historical Env Data)")
     log(f"Target dataset: {REPO_ID}")
     log("=" * 60)
 
-    # Collect environmental data first
-    env_data = {
-        "space": get_space_weather(),
-        "weather_cache": {}
-    }
+    env_history = fetch_environmental_history()
 
     try:
         existing_keys = get_existing_keys()
@@ -439,7 +465,7 @@ def main():
         sys.exit(1)
 
     try:
-        records = extract_calibration(service, env_data)
+        records = extract_calibration(service, env_history)
     except Exception as e:
         log(f"Fatal: Extraction failed: {e}")
         sys.exit(1)
