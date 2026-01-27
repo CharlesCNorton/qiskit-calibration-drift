@@ -1,3 +1,4 @@
 qiskit-ibm-runtime
 datasets
 huggingface_hub
+python-dateutil

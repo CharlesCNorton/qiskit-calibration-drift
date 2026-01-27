@@ -7,6 +7,7 @@ new measurements to a HuggingFace dataset. Designed for scheduled execution.
 
 import os
 from datetime import datetime, timezone
+from dateutil import parser as dateparser
 from qiskit_ibm_runtime import QiskitRuntimeService
 from datasets import load_dataset, Dataset, concatenate_datasets
 
@@ -14,12 +15,23 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 REPO_ID = "phanerozoic/qiskit-calibration-drift"
 
 
+def normalize_timestamp(ts_str):
+    """Convert any timestamp string to UTC ISO format for consistent comparison."""
+    try:
+        dt = dateparser.parse(str(ts_str))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return str(ts_str)
+
+
 def get_existing_keys():
     """Return set of (backend, qubit, property, calibrated_time) already in dataset."""
     try:
         ds = load_dataset(REPO_ID, split="train")
         return set(
-            (r["backend"], r["qubit"], r["property"], r["calibrated_time"])
+            (r["backend"], r["qubit"], r["property"], normalize_timestamp(r["calibrated_time"]))
             for r in ds
         )
     except Exception:
@@ -55,7 +67,7 @@ def extract_calibration():
                         "qubit": q,
                         "property": prop_name,
                         "value": float(value) if value is not None else None,
-                        "calibrated_time": str(cal_time),
+                        "calibrated_time": normalize_timestamp(cal_time),
                         "observed_time": observed_time,
                     })
             except Exception:
@@ -69,7 +81,7 @@ def extract_calibration():
                     "qubit": -1,
                     "property": f"cz_error_{edge[0]}_{edge[1]}",
                     "value": float(err) if err is not None else None,
-                    "calibrated_time": str(props.last_update_date),
+                    "calibrated_time": normalize_timestamp(props.last_update_date),
                     "observed_time": observed_time,
                 })
             except Exception:
