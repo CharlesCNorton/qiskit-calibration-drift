@@ -24,7 +24,7 @@ LOCATIONS = {
     "yorktown_heights_ny": {
         "lat": 41.27,
         "lon": -73.78,
-        "backends": ["ibm_torino", "ibm_fez", "ibm_marrakesh"],
+        "backends": ["ibm_torino", "ibm_fez", "ibm_marrakesh", "ibm_kingston"],
         "weather_station": "KHPN"
     }
 }
@@ -362,8 +362,8 @@ def get_location_for_backend(backend_name):
     """Return location info for a backend."""
     for loc_name, loc_info in LOCATIONS.items():
         if backend_name in loc_info["backends"]:
-            return loc_name, loc_info["lat"], loc_info["lon"], loc_info["weather_station"]
-    return "unknown", None, None, None
+            return loc_info["lat"], loc_info["lon"], loc_info["weather_station"]
+    return None, None, None
 
 
 def extract_calibration(service, env_history):
@@ -391,7 +391,7 @@ def extract_calibration(service, env_history):
         property_counts[name]["sx_error"] = 0
         property_counts[name]["cz_error"] = 0
 
-        location, lat, lon, weather_station = get_location_for_backend(name)
+        lat, lon, weather_station = get_location_for_backend(name)
 
         try:
             props = backend.properties()
@@ -433,7 +433,6 @@ def extract_calibration(service, env_history):
                         "value": float(value) if value is not None else None,
                         "calibrated_time": normalize_timestamp(cal_time),
                         "observed_time": observed_time,
-                        "location": location,
                         "latitude": float(lat) if lat is not None else None,
                         "longitude": float(lon) if lon is not None else None,
                         **env
@@ -477,7 +476,6 @@ def extract_calibration(service, env_history):
                     "value": float(sx_err),
                     "calibrated_time": normalize_timestamp(props.last_update_date),
                     "observed_time": observed_time,
-                    "location": location,
                     "latitude": float(lat) if lat is not None else None,
                     "longitude": float(lon) if lon is not None else None,
                     **env
@@ -509,7 +507,6 @@ def extract_calibration(service, env_history):
                     "value": float(err),
                     "calibrated_time": normalize_timestamp(props.last_update_date),
                     "observed_time": observed_time,
-                    "location": location,
                     "latitude": float(lat) if lat is not None else None,
                     "longitude": float(lon) if lon is not None else None,
                     **env
@@ -550,7 +547,6 @@ def cast_dataset_to_schema(ds):
         "value": Value("float64"),
         "calibrated_time": Value("string"),
         "observed_time": Value("string"),
-        "location": Value("string"),
         "latitude": Value("float64"),
         "longitude": Value("float64"),
         "solar_zenith_deg": Value("float64"),
@@ -580,7 +576,6 @@ def upload_records(new_records, existing_ds):
         "value": Value("float64"),
         "calibrated_time": Value("string"),
         "observed_time": Value("string"),
-        "location": Value("string"),
         "latitude": Value("float64"),
         "longitude": Value("float64"),
         "solar_zenith_deg": Value("float64"),
