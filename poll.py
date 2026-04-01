@@ -540,6 +540,10 @@ def cast_dataset_to_schema(ds):
     """Cast dataset columns to consistent schema to avoid type mismatches."""
     from datasets import Features, Value
 
+    # Drop legacy columns that no longer belong in the schema
+    if "location" in ds.column_names:
+        ds = ds.remove_columns(["location"])
+
     features = Features({
         "backend": Value("string"),
         "qubit": Value("int64"),
