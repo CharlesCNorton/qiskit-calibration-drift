@@ -1,11 +1,39 @@
 """
-IBM Quantum Calibration Data Collector
+IBM Quantum Calibration Drift Poller
 
-Extracts calibration parameters from IBM Quantum backends and appends
-new measurements to a HuggingFace dataset. Includes environmental data
-(weather, space weather) matched to calibration timestamps.
+Pulls the full BackendProperties from every available IBM Heron backend,
+parses every qubit-level and gate-level property, joins environmental and
+space-weather covariates, and appends new calibration events to the
+HuggingFace dataset.
+
+Schema (one row per (backend, property, qubit_a, qubit_b, calibrated_time)
+observation):
+  - backend, property, property_family, qubit_a, qubit_b, value, unit, scope
+  - is_failure_ceiling, is_new_measurement
+  - observed_time, calibrated_time, snapshot_update_time, calibration_age_seconds
+  - chipwide_recal_event_id
+  - latitude, longitude
+  - solar_zenith_deg, temperature_c, pressure_hpa, humidity_pct
+  - bz_gsm_nt, neutron_flux, kp_index, ap_index, Ap_daily, SN
+  - f107_observed_sfu, f107_adjusted_sfu, solar_flux_sfu, dst_nt
+
+Behaviour:
+  - Loads existing dataset; if the schema is the legacy 17-column version,
+    treats it as empty and starts the new schema fresh on the next push.
+    Existing legacy rows are not auto-migrated by the poller itself; that
+    is done as a separate one-shot job.
+  - Pulls each backend's `properties().to_dict()` once per run and walks the
+    qubits[] / gates[] structures to emit every parameter.
+  - Joins environmental data (NOAA SWPC, NMDB, weather.gov, GFZ Potsdam) by
+    closest timestamp to each parameter's calibrated_time.
+  - Computes is_new_measurement against the existing dataset's last value for
+    the same (backend, property, qubit_a, qubit_b) key.
+  - is_failure_ceiling=True iff property ends with `_error` or starts with
+    `prob_meas` and value >= 0.999.
+  - Detects chipwide_recal events: if >=20% of (qubit, property) units on the
+    same backend share a calibrated_time within the same poll, all rows from
+    that group get a shared event_id.
 """
-
 import os
 import sys
 import json
@@ -13,10 +41,11 @@ import math
 import re
 import time
 import urllib.request
+import urllib.parse
+import io
 import traceback
 from datetime import datetime, timezone, timedelta
 from dateutil import parser as dateparser
-
 
 REPO_ID = "phanerozoic/qiskit-calibration-drift"
 
@@ -25,32 +54,42 @@ LOCATIONS = {
         "lat": 41.27,
         "lon": -73.78,
         "backends": ["ibm_torino", "ibm_fez", "ibm_marrakesh", "ibm_kingston"],
-        "weather_station": "KHPN"
+        "weather_station": "KHPN",
     }
 }
-
-FLOAT_COLUMNS = [
-    "value", "latitude", "longitude", "solar_zenith_deg",
-    "temperature_c", "pressure_hpa", "humidity_pct",
-    "kp_index", "solar_flux_sfu", "dst_nt", "bz_gsm_nt", "neutron_flux"
-]
-
-EXPECTED_QUBIT_PROPERTIES = ["T1", "T2", "readout_error", "prob_meas0_prep1", "prob_meas1_prep0"]
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
+# Property -> family mapping (epoch4 canonical)
+FAMILY_MAP = {
+    "T1": "T1", "T2": "T2",
+    "readout_error": "readout_error", "readout_length": "readout_length",
+    "prob_meas0_prep1": "prob_meas0_prep1", "prob_meas1_prep0": "prob_meas1_prep0",
+    "reset_gate_length": "reset_length",
+    "sx_gate_error": "sx_error", "sx_gate_length": "sx_length",
+    "x_gate_error": "x_error", "x_gate_length": "x_length",
+    "id_gate_error": "id_error", "id_gate_length": "id_length",
+    "rx_gate_error": "rx_error", "rx_gate_length": "rx_length",
+    "xslow_gate_error": "xslow_error", "xslow_gate_length": "xslow_length",
+    "cz_gate_error": "cz_error", "cz_gate_length": "cz_length",
+    "rzz_gate_error": "rzz_error", "rzz_gate_length": "rzz_length",
+    "measure_2_gate_error": "measure_2_error", "measure_2_gate_length": "measure_2_length",
+}
+
 
 def log(msg):
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}")
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}] {msg}", flush=True)
 
 
-def parse_timestamp(ts_str):
-    """Parse timestamp string to datetime object."""
-    if ts_str is None:
+def parse_timestamp(ts):
+    if ts is None or ts == "":
         return None
     try:
-        dt = dateparser.parse(str(ts_str))
+        if isinstance(ts, datetime):
+            dt = ts
+        else:
+            dt = dateparser.parse(str(ts))
         if dt is None:
             return None
         if dt.tzinfo is None:
@@ -60,16 +99,7 @@ def parse_timestamp(ts_str):
         return None
 
 
-def normalize_timestamp(ts_str):
-    """Convert timestamp to standard string format."""
-    dt = parse_timestamp(ts_str)
-    if dt:
-        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-    return str(ts_str) if ts_str else ""
-
-
 def solar_zenith(lat, lon, dt):
-    """Calculate solar zenith angle in degrees. >90 = night."""
     if lat is None or lon is None or dt is None:
         return None
     try:
@@ -78,684 +108,538 @@ def solar_zenith(lat, lon, dt):
         decl = -23.45 * math.cos(math.radians(360 / 365 * (doy + 10)))
         solar_noon = 12 - lon / 15
         hour_angle = 15 * (hour - solar_noon)
-        lat_rad = math.radians(lat)
-        decl_rad = math.radians(decl)
-        hour_rad = math.radians(hour_angle)
+        lat_rad = math.radians(lat); decl_rad = math.radians(decl); hour_rad = math.radians(hour_angle)
         cos_zenith = (math.sin(lat_rad) * math.sin(decl_rad) +
                       math.cos(lat_rad) * math.cos(decl_rad) * math.cos(hour_rad))
-        zenith = math.degrees(math.acos(max(-1, min(1, cos_zenith))))
-        return round(zenith, 2)
+        return round(math.degrees(math.acos(max(-1, min(1, cos_zenith)))), 2)
     except Exception:
         return None
 
 
-def find_closest(history, target_dt, max_hours=48):
-    """Find closest historical value to target datetime."""
-    if not history or not target_dt:
-        return None
-
-    best_match = None
-    best_diff = timedelta(hours=max_hours)
-
-    for ts, value in history:
-        diff = abs(ts - target_dt)
-        if diff < best_diff:
-            best_diff = diff
-            best_match = value
-
-    return best_match
-
-
 def fetch_with_retry(url, headers=None, timeout=30, description="data"):
-    """Fetch URL with retry logic."""
-    last_error = None
+    last = None
     for attempt in range(MAX_RETRIES):
         try:
             req = urllib.request.Request(url, headers=headers or {})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except Exception as e:
-            last_error = e
+            last = e
             if attempt < MAX_RETRIES - 1:
-                log(f"    Retry {attempt + 1}/{MAX_RETRIES} for {description}: {e}")
                 time.sleep(RETRY_DELAY)
-    log(f"    Failed to fetch {description} after {MAX_RETRIES} attempts: {last_error}")
+    log(f"    {description} fetch failed after {MAX_RETRIES} tries: {last}")
     return None
 
 
-def fetch_kp_history():
-    """Fetch Kp index history (30 days available)."""
-    log("  Fetching Kp history...")
+def find_closest(history, target_dt, max_hours=48):
+    if not history or not target_dt:
+        return None
+    best = None; best_diff = timedelta(hours=max_hours)
+    for ts, value in history:
+        d = abs(ts - target_dt)
+        if d < best_diff:
+            best_diff = d; best = value
+    return best
+
+
+# ---------- Environmental data sources ----------
+
+def fetch_kp_noaa():
+    log("  Fetching NOAA Kp...")
+    url = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+    data_bytes = fetch_with_retry(url, description="Kp")
     history = []
-    try:
-        url = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
-        data_bytes = fetch_with_retry(url, description="Kp index")
-        if data_bytes:
+    if data_bytes:
+        try:
             data = json.loads(data_bytes)
             for row in data[1:]:
                 ts = parse_timestamp(row[0])
                 if ts and len(row) > 1 and row[1] is not None:
-                    try:
-                        history.append((ts, float(row[1])))
-                    except (ValueError, TypeError):
-                        pass
-            log(f"    Got {len(history)} Kp records")
-    except Exception as e:
-        log(f"    Warning: Kp fetch failed: {e}")
+                    try: history.append((ts, float(row[1])))
+                    except: pass
+        except Exception as e:
+            log(f"    Kp parse failed: {e}")
+    log(f"    Kp records: {len(history)}")
     return history
 
 
-def fetch_dst_history():
-    """Fetch Dst index history."""
-    log("  Fetching Dst history...")
+def fetch_dst_noaa():
+    log("  Fetching NOAA Dst...")
+    url = "https://services.swpc.noaa.gov/products/kyoto-dst.json"
+    data_bytes = fetch_with_retry(url, description="Dst")
     history = []
-    try:
-        url = "https://services.swpc.noaa.gov/products/kyoto-dst.json"
-        data_bytes = fetch_with_retry(url, description="Dst index")
-        if data_bytes:
+    if data_bytes:
+        try:
             data = json.loads(data_bytes)
             for row in data[1:]:
                 ts = parse_timestamp(row[0])
                 if ts and len(row) > 1 and row[1] is not None:
-                    try:
-                        history.append((ts, float(row[1])))
-                    except (ValueError, TypeError):
-                        pass
-            log(f"    Got {len(history)} Dst records")
-    except Exception as e:
-        log(f"    Warning: Dst fetch failed: {e}")
+                    try: history.append((ts, float(row[1])))
+                    except: pass
+        except Exception as e:
+            log(f"    Dst parse failed: {e}")
+    log(f"    Dst records: {len(history)}")
     return history
 
 
-def fetch_bz_history():
-    """Fetch Bz IMF history (7 days)."""
-    log("  Fetching Bz history...")
+def fetch_bz_noaa():
+    log("  Fetching NOAA Bz...")
+    url = "https://services.swpc.noaa.gov/products/solar-wind/mag-7-day.json"
+    data_bytes = fetch_with_retry(url, description="Bz")
     history = []
-    try:
-        url = "https://services.swpc.noaa.gov/products/solar-wind/mag-7-day.json"
-        data_bytes = fetch_with_retry(url, description="Bz IMF")
-        if data_bytes:
+    if data_bytes:
+        try:
             data = json.loads(data_bytes)
             for row in data[1:]:
                 ts = parse_timestamp(row[0])
                 if ts and len(row) > 3 and row[3] is not None:
-                    try:
-                        history.append((ts, float(row[3])))
-                    except (ValueError, TypeError):
-                        pass
-            log(f"    Got {len(history)} Bz records")
-    except Exception as e:
-        log(f"    Warning: Bz fetch failed: {e}")
+                    try: history.append((ts, float(row[3])))
+                    except: pass
+        except Exception as e:
+            log(f"    Bz parse failed: {e}")
+    log(f"    Bz records: {len(history)}")
     return history
 
 
-def fetch_solar_flux_history():
-    """Fetch solar flux (current value only, updates daily)."""
-    log("  Fetching solar flux...")
-    try:
-        url = "https://services.swpc.noaa.gov/products/summary/10cm-flux.json"
-        data_bytes = fetch_with_retry(url, timeout=15, description="solar flux")
-        if data_bytes:
+def fetch_solar_flux_noaa():
+    log("  Fetching NOAA 10cm flux...")
+    url = "https://services.swpc.noaa.gov/products/summary/10cm-flux.json"
+    data_bytes = fetch_with_retry(url, timeout=15, description="solar flux")
+    if data_bytes:
+        try:
             data = json.loads(data_bytes)
-            flux_val = data.get("Flux")
-            if flux_val is not None:
-                flux = float(flux_val)
-                log(f"    Solar flux: {flux} SFU")
-                return flux
-    except Exception as e:
-        log(f"    Warning: Solar flux fetch failed: {e}")
+            f = data.get("Flux")
+            if f is not None:
+                return float(f)
+        except Exception:
+            pass
     return None
 
 
-def fetch_neutron_history():
-    """Fetch neutron monitor history (last 48 hours)."""
-    log("  Fetching neutron history...")
+def fetch_neutron_nmdb():
+    log("  Fetching NMDB neutron flux...")
     history = []
     try:
         now = datetime.now(timezone.utc)
         start = now - timedelta(hours=48)
         url = (f"https://www.nmdb.eu/nest/draw_graph.php?formchk=1&stations[]=NEWK"
                f"&tabchoice=revori&dtype=corr_for_pressure&tresolution=60"
-               f"&date_choice=bydate"
-               f"&start_year={start.year}&start_month={start.month:02d}"
+               f"&date_choice=bydate&start_year={start.year}&start_month={start.month:02d}"
                f"&start_day={start.day:02d}&start_hour=0&start_min=0"
                f"&end_year={now.year}&end_month={now.month:02d}"
-               f"&end_day={now.day:02d}&end_hour=23&end_min=59"
-               f"&output=ascii")
-        headers = {"User-Agent": "qiskit-calibration-drift"}
-        data_bytes = fetch_with_retry(url, headers=headers, description="neutron flux")
+               f"&end_day={now.day:02d}&end_hour=23&end_min=59&output=ascii")
+        data_bytes = fetch_with_retry(url, headers={"User-Agent": "qiskit-calibration-drift"},
+                                      description="neutron")
         if data_bytes:
-            data = data_bytes.decode("utf-8")
-            pattern = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2});\s*([\d.]+)"
-            matches = re.findall(pattern, data)
-            for ts_str, val in matches:
+            data = data_bytes.decode("utf-8", errors="replace")
+            for ts_str, val in re.findall(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2});\s*([\d.]+)", data):
                 ts = parse_timestamp(ts_str)
                 if ts:
-                    try:
-                        history.append((ts, float(val)))
-                    except (ValueError, TypeError):
-                        pass
-            log(f"    Got {len(history)} neutron records")
+                    try: history.append((ts, float(val)))
+                    except: pass
     except Exception as e:
-        log(f"    Warning: Neutron fetch failed: {e}")
+        log(f"    neutron fetch error: {e}")
+    log(f"    neutron records: {len(history)}")
     return history
 
 
-def fetch_weather_history(station):
-    """Fetch weather observation history."""
-    log(f"  Fetching weather history ({station})...")
+def fetch_weather(station):
+    log(f"  Fetching weather ({station})...")
     history = []
     try:
         url = f"https://api.weather.gov/stations/{station}/observations"
-        headers = {"User-Agent": "qiskit-calibration-drift"}
-        data_bytes = fetch_with_retry(url, headers=headers, description=f"weather ({station})")
+        data_bytes = fetch_with_retry(url, headers={"User-Agent": "qiskit-calibration-drift"},
+                                       description=f"weather ({station})")
         if data_bytes:
             data = json.loads(data_bytes)
-            for feature in data.get("features", []):
-                props = feature.get("properties", {})
+            for feat in data.get("features", []):
+                props = feat.get("properties", {})
                 ts = parse_timestamp(props.get("timestamp"))
-                if ts:
-                    temp = props.get("temperature", {}).get("value")
-                    pres = props.get("barometricPressure", {}).get("value")
-                    hum = props.get("relativeHumidity", {}).get("value")
-                    history.append((ts, {
-                        "temperature_c": round(float(temp), 2) if temp is not None else None,
-                        "pressure_hpa": round(float(pres) / 100, 2) if pres is not None else None,
-                        "humidity_pct": round(float(hum), 2) if hum is not None else None
-                    }))
-            log(f"    Got {len(history)} weather records")
+                if not ts: continue
+                temp = props.get("temperature", {}).get("value")
+                pres = props.get("barometricPressure", {}).get("value")
+                hum = props.get("relativeHumidity", {}).get("value")
+                history.append((ts, {
+                    "temperature_c": round(float(temp), 2) if temp is not None else None,
+                    "pressure_hpa": round(float(pres) / 100, 2) if pres is not None else None,
+                    "humidity_pct": round(float(hum), 2) if hum is not None else None,
+                }))
     except Exception as e:
-        log(f"    Warning: Weather fetch failed: {e}")
+        log(f"    weather fetch error: {e}")
+    log(f"    weather records: {len(history)}")
     return history
 
 
-def fetch_environmental_history():
-    """Fetch all environmental data history."""
-    log("Fetching environmental history (48h)...")
-    return {
-        "kp": fetch_kp_history(),
-        "dst": fetch_dst_history(),
-        "bz": fetch_bz_history(),
-        "solar_flux": fetch_solar_flux_history(),
-        "neutron": fetch_neutron_history(),
-        "weather": {}
-    }
-
-
-def get_env_for_time(env_history, cal_dt, lat, lon, weather_station):
-    """Get environmental data for a specific calibration time."""
-    if weather_station and weather_station not in env_history["weather"]:
-        env_history["weather"][weather_station] = fetch_weather_history(weather_station)
-
-    weather_match = None
-    if weather_station and weather_station in env_history["weather"]:
-        weather_match = find_closest(env_history["weather"][weather_station], cal_dt)
-    weather = weather_match if weather_match else {}
-
-    return {
-        "solar_zenith_deg": solar_zenith(lat, lon, cal_dt),
-        "temperature_c": weather.get("temperature_c"),
-        "pressure_hpa": weather.get("pressure_hpa"),
-        "humidity_pct": weather.get("humidity_pct"),
-        "kp_index": find_closest(env_history["kp"], cal_dt),
-        "solar_flux_sfu": env_history["solar_flux"],
-        "dst_nt": find_closest(env_history["dst"], cal_dt),
-        "bz_gsm_nt": find_closest(env_history["bz"], cal_dt),
-        "neutron_flux": find_closest(env_history["neutron"], cal_dt),
-    }
-
-
-def normalize_record_schema(record):
-    """Ensure all float columns have consistent float64 type (or None)."""
-    for col in FLOAT_COLUMNS:
-        val = record.get(col)
-        if val is not None:
+def fetch_gfz_indices():
+    """GFZ Kp_ap_Ap_SN_F107 since 1932. Returns 3-hourly history."""
+    log("  Fetching GFZ Kp/ap/Ap/SN/F10.7...")
+    history = []
+    urls = [
+        "https://kp.gfz.de/app/files/Kp_ap_Ap_SN_F107_nowcast.txt",
+        "https://kp.gfz.de/app/files/Kp_ap_Ap_SN_F107_since_1932.txt",
+    ]
+    raw = None
+    for u in urls:
+        b = fetch_with_retry(u, description=f"GFZ ({u.split('/')[-1]})", timeout=60)
+        if b:
+            raw = b.decode("utf-8", errors="replace"); break
+    if not raw:
+        log("    GFZ fetch failed")
+        return history
+    cutoff_year = datetime.now(timezone.utc).year - 1
+    for line in raw.split("\n"):
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        nums = []
+        for p in parts:
+            try: nums.append(float(p))
+            except: pass
+        if len(nums) < 27:
+            continue
+        yyyy, mm, dd = int(nums[0]), int(nums[1]), int(nums[2])
+        if yyyy < cutoff_year:
+            continue
+        kp8 = nums[7:15]; ap8 = nums[15:23]
+        Ap = nums[23]; SN = nums[24]; f107_obs = nums[25]; f107_adj = nums[26]
+        for i, (kp, ap) in enumerate(zip(kp8, ap8)):
             try:
-                record[col] = float(val)
-            except (ValueError, TypeError):
-                record[col] = None
-    return record
+                ts = datetime(year=yyyy, month=mm, day=dd, hour=i*3, tzinfo=timezone.utc)
+            except Exception:
+                continue
+            history.append((ts, {
+                "kp_index_def": float(kp) if kp >= 0 else None,
+                "ap_index": float(ap) if ap >= 0 else None,
+                "Ap_daily": float(Ap) if Ap >= 0 else None,
+                "SN": float(SN) if SN >= 0 else None,
+                "f107_observed_sfu": float(f107_obs) if f107_obs >= 0 else None,
+                "f107_adjusted_sfu": float(f107_adj) if f107_adj >= 0 else None,
+            }))
+    log(f"    GFZ records: {len(history)}")
+    return history
 
 
-def get_existing_keys():
-    """Return set of existing record keys and the existing dataset."""
-    log("Loading existing dataset from HuggingFace...")
-    try:
-        from datasets import load_dataset
-        ds = load_dataset(REPO_ID, split="train")
-        keys = set(
-            (r["backend"], r["qubit"], r["property"], normalize_timestamp(r["calibrated_time"]))
-            for r in ds
-        )
-        log(f"Loaded {len(keys)} existing records.")
-        return keys, ds
-    except Exception as e:
-        log(f"Warning: Could not load existing dataset: {e}")
-        log("Starting with empty dataset.")
-        return set(), None
+def fetch_environmental():
+    log("Fetching environmental sources...")
+    return {
+        "kp": fetch_kp_noaa(),
+        "dst": fetch_dst_noaa(),
+        "bz": fetch_bz_noaa(),
+        "solar_flux_now": fetch_solar_flux_noaa(),
+        "neutron": fetch_neutron_nmdb(),
+        "weather": {},  # filled per station on demand
+        "gfz": fetch_gfz_indices(),
+    }
 
 
-def connect_ibm():
-    """Connect to IBM Quantum service."""
-    log("Connecting to IBM Quantum...")
-    try:
-        from qiskit_ibm_runtime import QiskitRuntimeService
-        token = os.environ.get("IBM_QUANTUM_TOKEN")
-        if token:
-            log("Using token from environment variable.")
-            service = QiskitRuntimeService(
-                channel="ibm_cloud",
-                token=token,
-                instance="crn:v1:bluemix:public:quantum-computing:us-east:a/a9114248c6c44fe88a40cda24e7073c3:a72852a9-5e25-429b-b8fc-8ac73fb30240::"
-            )
-        else:
-            log("Using saved credentials.")
-            service = QiskitRuntimeService()
-        log("Connected successfully.")
-        return service
-    except Exception as e:
-        log(f"Error: Failed to connect to IBM Quantum: {e}")
-        raise
+def env_for_time(env, dt, lat, lon, weather_station):
+    if weather_station and weather_station not in env["weather"]:
+        env["weather"][weather_station] = fetch_weather(weather_station)
+    w = find_closest(env["weather"].get(weather_station, []), dt) if weather_station else None
+    if not w:
+        w = {}
+    gfz = find_closest(env["gfz"], dt) if dt else None
+    if not gfz:
+        gfz = {}
+    return {
+        "solar_zenith_deg": solar_zenith(lat, lon, dt),
+        "temperature_c": w.get("temperature_c"),
+        "pressure_hpa": w.get("pressure_hpa"),
+        "humidity_pct": w.get("humidity_pct"),
+        "kp_index": gfz.get("kp_index_def") if gfz.get("kp_index_def") is not None
+                    else find_closest(env["kp"], dt),
+        "ap_index": gfz.get("ap_index"),
+        "Ap_daily": gfz.get("Ap_daily"),
+        "SN": gfz.get("SN"),
+        "f107_observed_sfu": gfz.get("f107_observed_sfu"),
+        "f107_adjusted_sfu": gfz.get("f107_adjusted_sfu"),
+        "solar_flux_sfu": env["solar_flux_now"],
+        "dst_nt": find_closest(env["dst"], dt),
+        "bz_gsm_nt": find_closest(env["bz"], dt),
+        "neutron_flux": find_closest(env["neutron"], dt),
+    }
 
 
-def get_location_for_backend(backend_name):
-    """Return location info for a backend."""
-    for loc_name, loc_info in LOCATIONS.items():
-        if backend_name in loc_info["backends"]:
-            return loc_info["lat"], loc_info["lon"], loc_info["weather_station"]
-    return None, None, None
+# ---------- IBM properties parsing ----------
 
+def parse_properties_dict(raw, backend_name, observed_dt, env):
+    """Walk the raw BackendProperties dict and emit canonical rows."""
+    lat = None; lon = None; ws = None
+    for loc in LOCATIONS.values():
+        if backend_name in loc["backends"]:
+            lat = loc["lat"]; lon = loc["lon"]; ws = loc["weather_station"]; break
 
-def extract_calibration(service, env_history):
-    """Extract calibration data with matched environmental data."""
-    log("Fetching backend list...")
-    try:
-        backends = service.backends()
-        log(f"Found {len(backends)} backends: {[b.name for b in backends]}")
-    except Exception as e:
-        log(f"Error: Failed to fetch backends: {e}")
-        raise
-
-    if not backends:
-        raise RuntimeError("No backends available")
-
-    observed_time = datetime.now(timezone.utc).isoformat()
+    snapshot_update = parse_timestamp(raw.get("last_update_date"))
     records = []
-    errors = []
-    property_counts = {}
 
-    for backend in backends:
-        name = backend.name
-        log(f"Processing {name}...")
-        property_counts[name] = {p: 0 for p in EXPECTED_QUBIT_PROPERTIES}
-        property_counts[name]["sx_error"] = 0
-        property_counts[name]["cz_error"] = 0
+    # qubit-level entries
+    for q_idx, q_entries in enumerate(raw.get("qubits", [])):
+        for nd in q_entries:
+            name = nd.get("name")
+            value = nd.get("value")
+            unit = nd.get("unit", "")
+            cal_dt = parse_timestamp(nd.get("date"))
+            e = env_for_time(env, cal_dt or observed_dt, lat, lon, ws)
+            records.append({
+                "backend": backend_name,
+                "property": name,
+                "property_family": FAMILY_MAP.get(name, name),
+                "qubit_a": q_idx, "qubit_b": None,
+                "value": float(value) if value is not None else None,
+                "unit": unit, "scope": "qubit",
+                "is_failure_ceiling": _is_ceiling(name, value),
+                "observed_time": observed_dt,
+                "calibrated_time": cal_dt,
+                "snapshot_update_time": snapshot_update,
+                "calibration_age_seconds": ((observed_dt - cal_dt).total_seconds()
+                                            if cal_dt else None),
+                "latitude": lat, "longitude": lon,
+                **e,
+            })
 
-        lat, lon, weather_station = get_location_for_backend(name)
-
-        try:
-            props = backend.properties()
-            config = backend.configuration()
-        except Exception as e:
-            log(f"  Error: Failed to get properties for {name}: {e}")
-            errors.append((name, "properties", str(e)))
-            continue
-
-        if props is None:
-            log(f"  Warning: No properties available for {name}")
-            errors.append((name, "properties", "None returned"))
-            continue
-
-        qubit_count = 0
-        qubit_errors = 0
-        for q in range(config.n_qubits):
-            try:
-                qprops = props.qubit_property(q)
-                if qprops is None:
-                    qubit_errors += 1
-                    continue
-
-                for prop_name, prop_data in qprops.items():
-                    if prop_name == "readout_length":
-                        continue
-
-                    if prop_data is None or len(prop_data) < 2:
-                        continue
-
-                    value, cal_time = prop_data[0], prop_data[1]
-                    cal_dt = parse_timestamp(cal_time)
-                    env = get_env_for_time(env_history, cal_dt, lat, lon, weather_station)
-
-                    record = {
-                        "backend": name,
-                        "qubit": q,
-                        "property": prop_name,
-                        "value": float(value) if value is not None else None,
-                        "calibrated_time": normalize_timestamp(cal_time),
-                        "observed_time": observed_time,
-                        "latitude": float(lat) if lat is not None else None,
-                        "longitude": float(lon) if lon is not None else None,
-                        **env
-                    }
-                    records.append(normalize_record_schema(record))
-
-                    if prop_name in property_counts[name]:
-                        property_counts[name][prop_name] += 1
-
-                qubit_count += 1
-            except Exception as e:
-                qubit_errors += 1
-                if qubit_errors <= 3:
-                    log(f"  Warning: Qubit {q} error: {e}")
-
-        if qubit_errors > 3:
-            log(f"  ... and {qubit_errors - 3} more qubit errors")
-
-        log(f"  Qubits processed: {qubit_count}/{config.n_qubits}")
-
-        for prop_name, count in property_counts[name].items():
-            if prop_name in EXPECTED_QUBIT_PROPERTIES:
-                expected = config.n_qubits
-                if count < expected:
-                    log(f"  Warning: {prop_name} only got {count}/{expected} qubits")
-
-        sx_count = 0
-        sx_errors = 0
-        for q in range(config.n_qubits):
-            try:
-                sx_err = props.gate_error("sx", q)
-                if sx_err is None:
-                    continue
-                cal_dt = parse_timestamp(props.last_update_date)
-                env = get_env_for_time(env_history, cal_dt, lat, lon, weather_station)
-
-                record = {
-                    "backend": name,
-                    "qubit": q,
-                    "property": "sx_error",
-                    "value": float(sx_err),
-                    "calibrated_time": normalize_timestamp(props.last_update_date),
-                    "observed_time": observed_time,
-                    "latitude": float(lat) if lat is not None else None,
-                    "longitude": float(lon) if lon is not None else None,
-                    **env
-                }
-                records.append(normalize_record_schema(record))
-                sx_count += 1
-            except Exception as e:
-                sx_errors += 1
-                if sx_errors <= 3:
-                    log(f"  Warning: SX gate error for qubit {q}: {e}")
-
-        property_counts[name]["sx_error"] = sx_count
-        log(f"  SX gates processed: {sx_count}/{config.n_qubits}")
-
-        edge_count = 0
-        edge_errors = 0
-        for edge in config.coupling_map:
-            try:
-                err = props.gate_error("cz", edge)
-                if err is None:
-                    continue
-                cal_dt = parse_timestamp(props.last_update_date)
-                env = get_env_for_time(env_history, cal_dt, lat, lon, weather_station)
-
-                record = {
-                    "backend": name,
-                    "qubit": -1,
-                    "property": f"cz_error_{edge[0]}_{edge[1]}",
-                    "value": float(err),
-                    "calibrated_time": normalize_timestamp(props.last_update_date),
-                    "observed_time": observed_time,
-                    "latitude": float(lat) if lat is not None else None,
-                    "longitude": float(lon) if lon is not None else None,
-                    **env
-                }
-                records.append(normalize_record_schema(record))
-                edge_count += 1
-            except Exception as e:
-                edge_errors += 1
-
-        property_counts[name]["cz_error"] = edge_count
-        log(f"  CZ edges processed: {edge_count}/{len(config.coupling_map)}")
-
-    log(f"Extraction complete. Total records: {len(records)}")
-
-    log("Property extraction summary:")
-    for backend_name, counts in property_counts.items():
-        log(f"  {backend_name}:")
-        for prop, count in counts.items():
-            log(f"    {prop}: {count}")
-
-    if errors:
-        log(f"Backend errors: {errors}")
-
-    if not records:
-        raise RuntimeError("No records extracted from any backend")
+    # gate-level entries
+    for g in raw.get("gates", []):
+        gname = g.get("gate")
+        qubits = g.get("qubits", [])
+        qa = int(qubits[0]) if len(qubits) >= 1 else None
+        qb = int(qubits[1]) if len(qubits) >= 2 else None
+        scope = "gate2q" if qb is not None else "gate1q"
+        for param in g.get("parameters", []):
+            pname = param.get("name")
+            value = param.get("value")
+            unit = param.get("unit", "")
+            cal_dt = parse_timestamp(param.get("date"))
+            prop = f"{gname}_{pname}"
+            e = env_for_time(env, cal_dt or observed_dt, lat, lon, ws)
+            records.append({
+                "backend": backend_name,
+                "property": prop,
+                "property_family": FAMILY_MAP.get(prop, prop),
+                "qubit_a": qa, "qubit_b": qb,
+                "value": float(value) if value is not None else None,
+                "unit": unit, "scope": scope,
+                "is_failure_ceiling": _is_ceiling(prop, value),
+                "observed_time": observed_dt,
+                "calibrated_time": cal_dt,
+                "snapshot_update_time": snapshot_update,
+                "calibration_age_seconds": ((observed_dt - cal_dt).total_seconds()
+                                            if cal_dt else None),
+                "latitude": lat, "longitude": lon,
+                **e,
+            })
 
     return records
 
 
-def cast_dataset_to_schema(ds):
-    """Cast dataset columns to consistent schema to avoid type mismatches."""
-    from datasets import Features, Value
-
-    # Drop legacy columns that no longer belong in the schema
-    if "location" in ds.column_names:
-        ds = ds.remove_columns(["location"])
-
-    features = Features({
-        "backend": Value("string"),
-        "qubit": Value("int64"),
-        "property": Value("string"),
-        "value": Value("float64"),
-        "calibrated_time": Value("string"),
-        "observed_time": Value("string"),
-        "latitude": Value("float64"),
-        "longitude": Value("float64"),
-        "solar_zenith_deg": Value("float64"),
-        "temperature_c": Value("float64"),
-        "pressure_hpa": Value("float64"),
-        "humidity_pct": Value("float64"),
-        "kp_index": Value("float64"),
-        "solar_flux_sfu": Value("float64"),
-        "dst_nt": Value("float64"),
-        "bz_gsm_nt": Value("float64"),
-        "neutron_flux": Value("float64"),
-    })
-
-    return ds.cast(features)
+def _is_ceiling(prop, value):
+    if value is None:
+        return False
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    if prop.endswith("_error") or prop.startswith("prob_meas"):
+        return v >= 0.999
+    return False
 
 
-def upload_records(new_records, existing_ds):
-    """Upload new records to HuggingFace dataset."""
-    log(f"Preparing to upload {len(new_records)} new records...")
+# ---------- Existing dataset handling ----------
 
-    from datasets import Dataset, concatenate_datasets, Features, Value
-
-    features = Features({
-        "backend": Value("string"),
-        "qubit": Value("int64"),
-        "property": Value("string"),
-        "value": Value("float64"),
-        "calibrated_time": Value("string"),
-        "observed_time": Value("string"),
-        "latitude": Value("float64"),
-        "longitude": Value("float64"),
-        "solar_zenith_deg": Value("float64"),
-        "temperature_c": Value("float64"),
-        "pressure_hpa": Value("float64"),
-        "humidity_pct": Value("float64"),
-        "kp_index": Value("float64"),
-        "solar_flux_sfu": Value("float64"),
-        "dst_nt": Value("float64"),
-        "bz_gsm_nt": Value("float64"),
-        "neutron_flux": Value("float64"),
-    })
-
-    for record in new_records:
-        normalize_record_schema(record)
-
-    new_ds = Dataset.from_list(new_records, features=features)
-    log(f"Created new dataset with {len(new_ds)} records.")
-
-    if existing_ds is not None and len(existing_ds) > 0:
-        log(f"Existing dataset has {len(existing_ds)} records.")
-        try:
-            existing_casted = cast_dataset_to_schema(existing_ds)
-            log("Cast existing dataset to consistent schema.")
-        except Exception as e:
-            log(f"Error: Failed to cast existing dataset: {e}")
-            log("ABORTING to prevent data loss. Please fix schema manually.")
-            raise RuntimeError(f"Schema cast failed: {e}")
-
-        try:
-            combined = concatenate_datasets([existing_casted, new_ds])
-            log(f"Combined dataset has {len(combined)} records.")
-        except Exception as e:
-            log(f"Error: Concatenation failed: {e}")
-            log("ABORTING to prevent data loss. Do NOT overwrite existing data.")
-            raise RuntimeError(f"Concatenation failed: {e}")
-    else:
-        log("No existing dataset. Creating new.")
-        combined = new_ds
-
-    log("Pushing to HuggingFace Hub...")
-    for attempt in range(MAX_RETRIES):
-        try:
-            combined.push_to_hub(REPO_ID, private=False)
-            log("Upload complete.")
-            return
-        except Exception as e:
-            log(f"Upload attempt {attempt + 1}/{MAX_RETRIES} failed: {e}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY * 2)
-            else:
-                raise RuntimeError(f"Upload failed after {MAX_RETRIES} attempts: {e}")
+def load_existing_dataset():
+    log("Loading existing HF dataset...")
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id=REPO_ID, repo_type="dataset",
+            filename="data/train-00000-of-00001.parquet"
+        )
+        import pandas as pd
+        df = pd.read_parquet(path)
+        log(f"  loaded {len(df):,} rows, {len(df.columns)} cols")
+        # Coerce to new schema if needed
+        if "qubit_a" not in df.columns and "qubit" in df.columns:
+            log("  legacy 17-col schema detected; will be replaced by new-schema rows.")
+            return None
+        return df
+    except Exception as e:
+        log(f"  could not load existing dataset: {e}")
+        return None
 
 
-def validate_records(records):
-    """Validate extracted records for data quality."""
-    log("Validating extracted records...")
+CANONICAL_COLUMNS = [
+    "backend", "property_family", "property", "qubit_a", "qubit_b", "value", "unit", "scope",
+    "is_failure_ceiling", "observed_time", "calibrated_time", "snapshot_update_time",
+    "calibration_age_seconds", "is_new_measurement", "chipwide_recal_event_id",
+    "latitude", "longitude",
+    "solar_zenith_deg", "temperature_c", "pressure_hpa", "humidity_pct",
+    "bz_gsm_nt", "neutron_flux", "kp_index", "ap_index", "Ap_daily", "SN",
+    "f107_observed_sfu", "f107_adjusted_sfu", "solar_flux_sfu", "dst_nt",
+]
 
-    issues = []
 
+def to_canonical(df):
+    import pandas as pd
+    for c in CANONICAL_COLUMNS:
+        if c not in df.columns:
+            df[c] = pd.NA
+    return df[CANONICAL_COLUMNS]
+
+
+def detect_chipwide(records):
+    """Group rows whose (backend, calibrated_time) match and that span >= 20% of
+    that backend's units; assign a shared chipwide_recal_event_id."""
     if not records:
-        issues.append("No records extracted")
-        return issues
-
-    backends = set(r["backend"] for r in records)
-    log(f"  Backends in records: {backends}")
-
-    for backend in backends:
-        backend_records = [r for r in records if r["backend"] == backend]
-
-        t1_count = len([r for r in backend_records if r["property"] == "T1"])
-        t2_count = len([r for r in backend_records if r["property"] == "T2"])
-        readout_count = len([r for r in backend_records if r["property"] == "readout_error"])
-        p01_count = len([r for r in backend_records if r["property"] == "prob_meas0_prep1"])
-        p10_count = len([r for r in backend_records if r["property"] == "prob_meas1_prep0"])
-        sx_count = len([r for r in backend_records if r["property"] == "sx_error"])
-
-        log(f"  {backend}: T1={t1_count}, T2={t2_count}, readout_error={readout_count}, "
-            f"prob_meas0_prep1={p01_count}, prob_meas1_prep0={p10_count}, sx_error={sx_count}")
-
-        if t1_count == 0:
-            issues.append(f"{backend}: No T1 data extracted")
-        if t2_count == 0:
-            issues.append(f"{backend}: No T2 data extracted")
-        if readout_count == 0:
-            issues.append(f"{backend}: No readout_error data extracted")
-
-    null_counts = {col: 0 for col in FLOAT_COLUMNS}
+        return
+    by_bt = {}
+    for i, r in enumerate(records):
+        key = (r["backend"], r["calibrated_time"])
+        by_bt.setdefault(key, []).append(i)
+    backend_counts = {}
     for r in records:
-        for col in FLOAT_COLUMNS:
-            if r.get(col) is None:
-                null_counts[col] += 1
+        backend_counts[r["backend"]] = backend_counts.get(r["backend"], 0) + 1
+    for (be, t), idxs in by_bt.items():
+        if t is None or backend_counts.get(be, 0) == 0:
+            continue
+        if len(idxs) / backend_counts[be] >= 0.20:
+            eid = f"{be}__chipwide__{t.strftime('%Y%m%dT%H%M%SZ')}"
+            for i in idxs:
+                records[i]["chipwide_recal_event_id"] = eid
 
-    total = len(records)
-    for col, count in null_counts.items():
-        pct = 100 * count / total
-        if pct > 50:
-            issues.append(f"Column {col} is {pct:.1f}% null")
 
-    if issues:
-        log("Validation issues found:")
-        for issue in issues:
-            log(f"  - {issue}")
-    else:
-        log("  Validation passed.")
+def compute_is_new(new_records, existing_df):
+    """Set is_new_measurement based on the latest existing value for the same
+    (backend, property, qubit_a, qubit_b)."""
+    import pandas as pd
+    prior = {}
+    if existing_df is not None and len(existing_df) > 0:
+        key_cols = ["backend", "property", "qubit_a", "qubit_b"]
+        # Latest value per key
+        df = existing_df.dropna(subset=["calibrated_time"]).copy()
+        df = df.sort_values("calibrated_time")
+        for k, g in df.groupby(key_cols, dropna=False):
+            prior[k] = g.iloc[-1]["value"]
+    for r in new_records:
+        k = (r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
+        pv = prior.get(k)
+        if pv is None or (r["value"] is not None and pv != r["value"]):
+            r["is_new_measurement"] = True
+        else:
+            r["is_new_measurement"] = False
+    # Within this batch, also mark first occurrence of (key, value) as new
+    seen = {}
+    for r in new_records:
+        k = (r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
+        last = seen.get(k)
+        if last is not None and last == r["value"]:
+            r["is_new_measurement"] = False
+        seen[k] = r["value"]
 
-    return issues
+
+# ---------- IBM connection + main ----------
+
+def connect_ibm():
+    from qiskit_ibm_runtime import QiskitRuntimeService
+    token = os.environ.get("IBM_QUANTUM_TOKEN")
+    if token:
+        return QiskitRuntimeService(
+            channel="ibm_cloud", token=token,
+            instance="crn:v1:bluemix:public:quantum-computing:us-east:"
+                     "a/a9114248c6c44fe88a40cda24e7073c3:"
+                     "a72852a9-5e25-429b-b8fc-8ac73fb30240::"
+        )
+    return QiskitRuntimeService()
+
+
+def push(combined_df):
+    import pandas as pd
+    from huggingface_hub import HfApi
+    # Save to a parquet, then upload by file (avoids dataset.push_to_hub schema issues)
+    tmp = "/tmp/qiskit_train.parquet" if os.name != "nt" else os.path.join(
+        os.environ.get("TEMP", "."), "qiskit_train.parquet")
+    combined_df.to_parquet(tmp, index=False)
+    log(f"  wrote {tmp} ({os.path.getsize(tmp):,} bytes)")
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    api.upload_file(
+        path_or_fileobj=tmp,
+        path_in_repo="data/train-00000-of-00001.parquet",
+        repo_id=REPO_ID, repo_type="dataset",
+        commit_message=f"poll {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}: "
+                       f"+{len(combined_df) - (0 if combined_df is None else len(combined_df))} rows",
+    )
+    log("  uploaded to HF")
 
 
 def main():
     log("=" * 60)
-    log("IBM Quantum Calibration Poller (with Historical Env Data)")
-    log(f"Target dataset: {REPO_ID}")
+    log("IBM Quantum Calibration Drift Poller")
+    log(f"Target: {REPO_ID}")
     log("=" * 60)
 
-    exit_code = 0
+    env = fetch_environmental()
 
-    try:
-        env_history = fetch_environmental_history()
-    except Exception as e:
-        log(f"Warning: Environmental fetch had errors: {e}")
-        env_history = {"kp": [], "dst": [], "bz": [], "solar_flux": None, "neutron": [], "weather": {}}
-
-    try:
-        existing_keys, existing_ds = get_existing_keys()
-    except Exception as e:
-        log(f"Warning: Could not get existing keys: {e}")
-        log(traceback.format_exc())
-        existing_keys = set()
-        existing_ds = None
+    existing = load_existing_dataset()
 
     try:
         service = connect_ibm()
     except Exception as e:
-        log(f"Fatal: Could not connect to IBM: {e}")
+        log(f"FATAL: IBM connect failed: {e}")
         log(traceback.format_exc())
         sys.exit(1)
 
-    try:
-        records = extract_calibration(service, env_history)
-    except Exception as e:
-        log(f"Fatal: Extraction failed: {e}")
-        log(traceback.format_exc())
-        sys.exit(1)
+    log("Fetching backend list...")
+    backends = list(service.backends())
+    log(f"  {len(backends)} backends: {[b.name for b in backends]}")
 
-    validation_issues = validate_records(records)
+    observed_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    all_records = []
+    for be in backends:
+        log(f"Processing {be.name}...")
+        try:
+            props_obj = be.properties()
+            if props_obj is None:
+                log(f"  no properties for {be.name}")
+                continue
+            raw = props_obj.to_dict()
+        except Exception as e:
+            log(f"  property fetch failed: {e}")
+            continue
+        recs = parse_properties_dict(raw, be.name, observed_dt, env)
+        all_records.extend(recs)
+        log(f"  {len(recs)} records")
 
-    log("Filtering for new records...")
-    new_records = [
-        r for r in records
-        if (r["backend"], r["qubit"], r["property"], r["calibrated_time"])
-        not in existing_keys
-    ]
-    log(f"New records: {len(new_records)} / {len(records)} extracted")
+    if not all_records:
+        log("No records extracted; exiting.")
+        sys.exit(0)
 
-    if not new_records:
-        log("No new calibration data. Done.")
-        if validation_issues:
-            log("WARNING: Validation issues were found (see above).")
-            exit_code = 0
-        sys.exit(exit_code)
+    log(f"Total extracted: {len(all_records):,}")
+    detect_chipwide(all_records)
+    compute_is_new(all_records, existing)
 
-    try:
-        upload_records(new_records, existing_ds)
-    except Exception as e:
-        log(f"Fatal: Upload failed: {e}")
-        log(traceback.format_exc())
-        sys.exit(1)
+    import pandas as pd
+    new_df = pd.DataFrame(all_records)
+    new_df = to_canonical(new_df)
 
-    log("=" * 60)
-    log(f"Successfully uploaded {len(new_records)} new records.")
-    if validation_issues:
-        log(f"WARNING: {len(validation_issues)} validation issues found.")
-    log("=" * 60)
+    # Dedup against existing
+    if existing is not None and len(existing) > 0:
+        existing = to_canonical(existing)
+        key_cols = ["backend", "property", "qubit_a", "qubit_b", "calibrated_time"]
+        # Coerce calibrated_time to datetime
+        existing["calibrated_time"] = pd.to_datetime(existing["calibrated_time"], utc=True)
+        new_df["calibrated_time"] = pd.to_datetime(new_df["calibrated_time"], utc=True)
+        existing_keys = set(map(tuple, existing[key_cols].astype(str).values.tolist()))
+        new_keys = list(map(tuple, new_df[key_cols].astype(str).values.tolist()))
+        mask = [k not in existing_keys for k in new_keys]
+        new_df = new_df[mask].copy()
+        log(f"After dedup vs existing: {len(new_df):,} truly new rows")
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df
 
-    sys.exit(exit_code)
+    log(f"Combined dataset: {len(combined):,} rows")
+
+    push(combined)
+    log("Done.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
