@@ -5,11 +5,27 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   poll:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # GitHub disables scheduled workflows in public repos after 60 days with no
+      # repository activity. This poller writes only to HuggingFace, so the repo
+      # would otherwise go silent and the schedule would be switched off.
+      - name: Keepalive commit
+        run: |
+          age=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "Days since last commit: $age"
+          if [ "$age" -lt 45 ]; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --allow-empty -m 'keepalive: reset scheduled-workflow inactivity timer'
+          git push || echo 'keepalive push skipped'
 
       - name: Set up Python
         uses: actions/setup-python@v5
