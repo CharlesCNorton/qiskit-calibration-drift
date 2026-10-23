@@ -6,42 +6,22 @@ Automated collection of IBM Quantum hardware calibration data with environmental
 
 [huggingface.co/datasets/phanerozoic/qiskit-calibration-drift](https://huggingface.co/datasets/phanerozoic/qiskit-calibration-drift)
 
-## Schema
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `backend` | string | Backend name (ibm_torino, ibm_fez, ibm_marrakesh, ibm_kingston) |
-| `qubit` | int | Qubit index (-1 for two-qubit gate data) |
-| `property` | string | T1, T2, readout_error, prob_meas0_prep1, prob_meas1_prep0, sx_error, cz_error_i_j |
-| `value` | float | Measured value |
-| `calibrated_time` | string | IBM calibration timestamp (UTC) |
-| `observed_time` | string | Collection timestamp (UTC) |
-| `latitude` | float | Data center latitude (41.27) |
-| `longitude` | float | Data center longitude (-73.78) |
-| `solar_zenith_deg` | float | Solar zenith angle (>90 = night) |
-| `temperature_c` | float | Local temperature (°C) |
-| `pressure_hpa` | float | Barometric pressure (hPa) |
-| `humidity_pct` | float | Relative humidity (%) |
-| `kp_index` | float | Planetary K-index (0-9) |
-| `solar_flux_sfu` | float | 10.7cm solar radio flux (SFU) |
-| `dst_nt` | float | Dst index (nT) |
-| `bz_gsm_nt` | float | IMF Bz component (nT) |
-| `neutron_flux` | float | Cosmic ray flux (Newark, DE monitor) |
+The schema, one row per `(backend, property, qubit_a, qubit_b, calibrated_time)` with 31 columns, is documented on the dataset card.
 
 ## Data Sources
 
 | Data | Source | Update Frequency |
 |------|--------|------------------|
-| Calibration | IBM Quantum Runtime API | Per IBM calibration cycle |
-| Weather | NWS API (NOAA) | Hourly |
-| Kp, Solar flux | SWPC (NOAA) | 3-hourly / daily |
-| Dst index | Kyoto/NOAA | Hourly |
-| Bz (IMF) | SWPC (NOAA) | Real-time |
-| Neutron flux | NMDB (Newark, DE) | Hourly |
+| Calibration | IBM Quantum Runtime API (`backend.properties()`) | Per IBM calibration cycle |
+| Weather | NWS API, station KHPN | Hourly |
+| Kp, ap, Ap, SN, F10.7 | GFZ Potsdam | 3-hourly / daily |
+| Kp (fallback), 10.7 cm flux, Dst | NOAA SWPC | 3-hourly / daily / hourly |
+| Bz (IMF, GSM) | NOAA SWPC real-time solar wind, operational L1 spacecraft | 1 minute |
+| Neutron flux | NMDB, Newark station | Hourly |
 
 ## Collection
 
-Runs every 30 minutes via GitHub Actions. Only new calibration data (by `calibrated_time`) is appended.
+`poll.py` runs every 30 minutes via GitHub Actions. For each backend it reads the historical `BackendProperties` at every half hour since that backend's last poll in the dataset (up to 14 days back) and then the live snapshot, and appends the rows whose `(backend, property, qubit_a, qubit_b, calibrated_time)` is not yet in the dataset. Each covariate is the sample nearest to `calibrated_time` among those its source had published by `observed_time`, within a tolerance set per source in `COVARIATES`; empty covariate cells of rows observed in the last 35 days are filled on later runs once the source publishes them.
 
 ## Setup
 

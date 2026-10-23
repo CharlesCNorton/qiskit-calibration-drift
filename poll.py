@@ -22,12 +22,18 @@ Behaviour:
     treats it as empty and starts the new schema fresh on the next push.
     Existing legacy rows are not auto-migrated by the poller itself; that
     is done as a separate one-shot job.
-  - Pulls each backend's `properties().to_dict()` once per run and walks the
-    qubits[] / gates[] structures to emit every parameter.
-  - Joins environmental data (NOAA SWPC, NMDB, weather.gov, GFZ Potsdam) by
-    closest timestamp to each parameter's calibrated_time.
-  - Computes is_new_measurement against the existing dataset's last value for
-    the same (backend, property, qubit_a, qubit_b) key.
+  - Pulls each backend's `properties().to_dict()` and walks the qubits[] /
+    gates[] structures to emit every parameter. Before the live snapshot it
+    pulls the historical snapshot at every half hour since the backend's last
+    poll in the dataset (at most GAP_DAYS back), so a late or failed run loses
+    no calibration.
+  - Joins environmental data (NOAA SWPC, NMDB, weather.gov, GFZ Potsdam): each
+    covariate is the sample nearest to calibrated_time among those the source
+    had published by observed_time, within the tolerance in COVARIATES.
+  - Fills empty covariate cells of rows observed in the last REFILL_DAYS once
+    the source has published them.
+  - Computes is_new_measurement against the latest earlier value for the same
+    (backend, property, qubit_a, qubit_b) key.
   - is_failure_ceiling=True iff property ends with `_error` or starts with
     `prob_meas` and value >= 0.999.
   - Detects chipwide_recal events: if >=20% of (qubit, property) units on the
@@ -60,6 +66,8 @@ LOCATIONS = {
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5
+GAP_DAYS = 14
+REFILL_DAYS = 35
 
 # Property -> family mapping (epoch4 canonical)
 FAMILY_MAP = {
@@ -131,17 +139,6 @@ def fetch_with_retry(url, headers=None, timeout=30, description="data"):
     return None
 
 
-def find_closest(history, target_dt, max_hours=48):
-    if not history or not target_dt:
-        return None
-    best = None; best_diff = timedelta(hours=max_hours)
-    for ts, value in history:
-        d = abs(ts - target_dt)
-        if d < best_diff:
-            best_diff = d; best = value
-    return best
-
-
 # ---------- Environmental data sources ----------
 
 def fetch_kp_noaa():
@@ -204,18 +201,22 @@ def fetch_bz_noaa():
 
 
 def fetch_solar_flux_noaa():
+    """Daily 20 UT (noon) 10.7 cm flux for the last 30 days plus the current summary value."""
     log("  Fetching NOAA 10cm flux...")
-    url = "https://services.swpc.noaa.gov/products/summary/10cm-flux.json"
-    data_bytes = fetch_with_retry(url, timeout=15, description="solar flux")
-    if data_bytes:
-        try:
-            data = json.loads(data_bytes)
-            f = max(data, key=lambda r: r.get("time_tag") or "").get("flux") if data else None
-            if f is not None:
-                return float(f)
-        except Exception:
-            pass
-    return None
+    history = {}
+    for url in ("https://services.swpc.noaa.gov/products/10cm-flux-30-day.json",
+                "https://services.swpc.noaa.gov/products/summary/10cm-flux.json"):
+        data_bytes = fetch_with_retry(url, timeout=15, description="solar flux")
+        if data_bytes:
+            try:
+                for row in json.loads(data_bytes):
+                    ts = parse_timestamp(row.get("time_tag"))
+                    if ts and row.get("flux") is not None:
+                        history[ts] = float(row["flux"])
+            except Exception as e:
+                log(f"    solar flux parse failed: {e}")
+    log(f"    solar flux records: {len(history)}")
+    return sorted(history.items())
 
 
 def fetch_neutron_nmdb():
@@ -223,7 +224,7 @@ def fetch_neutron_nmdb():
     history = []
     try:
         now = datetime.now(timezone.utc)
-        start = now - timedelta(hours=48)
+        start = now - timedelta(days=7)
         url = (f"https://www.nmdb.eu/nest/draw_graph.php?formchk=1&stations[]=NEWK"
                f"&tabchoice=revori&dtype=corr_for_pressure&tresolution=60"
                f"&date_choice=bydate&start_year={start.year}&start_month={start.month:02d}"
@@ -327,49 +328,124 @@ def fetch_environmental():
         "kp": fetch_kp_noaa(),
         "dst": fetch_dst_noaa(),
         "bz": fetch_bz_noaa(),
-        "solar_flux_now": fetch_solar_flux_noaa(),
+        "solar_flux": fetch_solar_flux_noaa(),
         "neutron": fetch_neutron_nmdb(),
-        "weather": {},  # filled per station on demand
+        "weather": {loc["weather_station"]: fetch_weather(loc["weather_station"])
+                    for loc in LOCATIONS.values()},
         "gfz": fetch_gfz_indices(),
     }
 
 
-def env_for_time(env, dt, lat, lon, weather_station):
-    if weather_station and weather_station not in env["weather"]:
-        env["weather"][weather_station] = fetch_weather(weather_station)
-    w = find_closest(env["weather"].get(weather_station, []), dt) if weather_station else None
-    if not w:
-        w = {}
-    gfz = find_closest(env["gfz"], dt) if dt else None
-    if not gfz:
-        gfz = {}
-    return {
-        "solar_zenith_deg": solar_zenith(lat, lon, dt),
-        "temperature_c": w.get("temperature_c"),
-        "pressure_hpa": w.get("pressure_hpa"),
-        "humidity_pct": w.get("humidity_pct"),
-        "kp_index": gfz.get("kp_index_def") if gfz.get("kp_index_def") is not None
-                    else find_closest(env["kp"], dt),
-        "ap_index": gfz.get("ap_index"),
-        "Ap_daily": gfz.get("Ap_daily"),
-        "SN": gfz.get("SN"),
-        "f107_observed_sfu": gfz.get("f107_observed_sfu"),
-        "f107_adjusted_sfu": gfz.get("f107_adjusted_sfu"),
-        "solar_flux_sfu": env["solar_flux_now"],
-        "dst_nt": find_closest(env["dst"], dt),
-        "bz_gsm_nt": find_closest(env["bz"], dt),
-        "neutron_flux": find_closest(env["neutron"], dt),
-    }
+# (column, env history, field of a dict-valued sample, tolerance, publication lag). A sample
+# tagged at the start of its interval is published one interval later; GFZ's file carries
+# every 3-hour bin of the current day, so its limit is the day's last bin (lag None).
+# kp_index takes GFZ's value and falls back to NOAA's.
+COVARIATES = [
+    ("temperature_c", "weather", "temperature_c", timedelta(hours=3), timedelta(0)),
+    ("pressure_hpa", "weather", "pressure_hpa", timedelta(hours=3), timedelta(0)),
+    ("humidity_pct", "weather", "humidity_pct", timedelta(hours=3), timedelta(0)),
+    ("bz_gsm_nt", "bz", None, timedelta(minutes=10), timedelta(minutes=1)),
+    ("neutron_flux", "neutron", None, timedelta(hours=3), timedelta(hours=1)),
+    ("dst_nt", "dst", None, timedelta(hours=3), timedelta(hours=1)),
+    ("kp_index", "gfz", "kp_index_def", timedelta(hours=3), None),
+    ("ap_index", "gfz", "ap_index", timedelta(hours=3), None),
+    ("Ap_daily", "gfz", "Ap_daily", timedelta(hours=3), None),
+    ("SN", "gfz", "SN", timedelta(hours=3), None),
+    ("f107_observed_sfu", "gfz", "f107_observed_sfu", timedelta(hours=3), None),
+    ("f107_adjusted_sfu", "gfz", "f107_adjusted_sfu", timedelta(hours=3), None),
+    ("kp_index", "kp", None, timedelta(hours=6), timedelta(hours=3)),
+]
+COVARIATE_COLUMNS = list(dict.fromkeys([c[0] for c in COVARIATES] + ["solar_flux_sfu"]))
+BACKEND_STATION = {b: loc["weather_station"] for loc in LOCATIONS.values() for b in loc["backends"]}
+
+
+def _us(series):
+    import pandas as pd
+    return ((series - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(microseconds=1)).to_numpy("int64")
+
+
+def _series(history, field=None):
+    """Sorted sample times (us since epoch) and values from a [(ts, value)] history."""
+    import numpy as np
+    pts = sorted(history, key=lambda p: p[0])
+    t = np.array([int(ts.timestamp() * 1_000_000) for ts, _ in pts], dtype="int64")
+    v = np.array([np.nan if (x if field is None else x.get(field)) is None
+                  else float(x if field is None else x.get(field)) for _, x in pts], dtype="float64")
+    return t, v
+
+
+def _nearest(src_t, src_v, target, limit, tol):
+    """Value of the sample nearest to each target among samples at or before its limit,
+    strictly within `tol` us; the earlier sample on a tie; NaN when there is none."""
+    import numpy as np
+    out = np.full(len(target), np.nan)
+    if len(src_t) == 0 or len(target) == 0:
+        return out
+    last = np.searchsorted(src_t, limit, side="right") - 1
+    i = np.searchsorted(src_t, target, side="left")
+    a = np.minimum(i, last); b = np.minimum(i - 1, last)
+    big = np.iinfo(np.int64).max
+    da = np.where(a >= 0, np.abs(src_t[np.clip(a, 0, None)] - target), big)
+    db = np.where(b >= 0, np.abs(src_t[np.clip(b, 0, None)] - target), big)
+    j = np.clip(np.where(da < db, a, b), 0, None)
+    ok = np.minimum(da, db) < tol
+    out[ok] = src_v[j[ok]]
+    return out
+
+
+def add_covariates(df, env):
+    """Fill the empty covariate cells of `df` (backend, calibrated_time, observed_time and any
+    covariate columns) from `env`; cells that already hold a value are kept."""
+    import numpy as np
+    import pandas as pd
+    obs = pd.to_datetime(df["observed_time"], utc=True)
+    target = _us(pd.to_datetime(df["calibrated_time"], utc=True).fillna(obs))
+    obs_us = _us(obs)
+    day_limit = _us(obs.dt.floor("D") + pd.Timedelta(hours=21))
+    station = df["backend"].astype(object).map(BACKEND_STATION).to_numpy()
+    us = lambda td: int(td / timedelta(microseconds=1))
+    for col, key, field, tol, lag in COVARIATES:
+        have = (df[col].to_numpy(dtype="float64", na_value=np.nan, copy=True) if col in df
+                else np.full(len(df), np.nan))
+        need = np.isnan(have)
+        if not need.any():
+            df[col] = have
+            continue
+        limit = day_limit if lag is None else obs_us - us(lag)
+        if key == "weather":
+            groups = [(ws, need & (station == ws)) for ws in env["weather"]]
+            hists = {ws: env["weather"][ws] for ws in env["weather"]}
+        else:
+            groups = [(key, need)]
+            hists = {key: env[key]}
+        for name, m in groups:
+            if m.any():
+                st, sv = _series(hists[name], field)
+                have[m] = _nearest(st, sv, target[m], limit[m], us(tol))
+        df[col] = have
+    # SWPC's summary flux at observed_time: the day's 20 UT flux, published from 21 UT
+    have = (df["solar_flux_sfu"].to_numpy(dtype="float64", na_value=np.nan, copy=True) if "solar_flux_sfu" in df
+            else np.full(len(df), np.nan))
+    need = np.isnan(have)
+    st, sv = _series(env["solar_flux"])
+    if need.any() and len(st):
+        pub = st + us(timedelta(hours=1))
+        k = np.searchsorted(pub, obs_us, side="right") - 1
+        ok = need & (k >= 0) & (obs_us - pub[np.clip(k, 0, None)] < us(timedelta(hours=72)))
+        have[ok] = sv[np.clip(k, 0, None)[ok]]
+    df["solar_flux_sfu"] = have
+    return df
 
 
 # ---------- IBM properties parsing ----------
 
-def parse_properties_dict(raw, backend_name, observed_dt, env):
-    """Walk the raw BackendProperties dict and emit canonical rows."""
-    lat = None; lon = None; ws = None
+def parse_properties_dict(raw, backend_name, observed_dt):
+    """Walk the raw BackendProperties dict and emit canonical rows (covariates other than
+    solar_zenith_deg are attached later by add_covariates)."""
+    lat = None; lon = None
     for loc in LOCATIONS.values():
         if backend_name in loc["backends"]:
-            lat = loc["lat"]; lon = loc["lon"]; ws = loc["weather_station"]; break
+            lat = loc["lat"]; lon = loc["lon"]; break
 
     snapshot_update = parse_timestamp(raw.get("last_update_date"))
     records = []
@@ -381,7 +457,6 @@ def parse_properties_dict(raw, backend_name, observed_dt, env):
             value = nd.get("value")
             unit = nd.get("unit", "")
             cal_dt = parse_timestamp(nd.get("date"))
-            e = env_for_time(env, cal_dt or observed_dt, lat, lon, ws)
             records.append({
                 "backend": backend_name,
                 "property": name,
@@ -396,7 +471,7 @@ def parse_properties_dict(raw, backend_name, observed_dt, env):
                 "calibration_age_seconds": ((observed_dt - cal_dt).total_seconds()
                                             if cal_dt else None),
                 "latitude": lat, "longitude": lon,
-                **e,
+                "solar_zenith_deg": solar_zenith(lat, lon, cal_dt or observed_dt),
             })
 
     # gate-level entries
@@ -412,7 +487,6 @@ def parse_properties_dict(raw, backend_name, observed_dt, env):
             unit = param.get("unit", "")
             cal_dt = parse_timestamp(param.get("date"))
             prop = f"{gname}_{pname}"
-            e = env_for_time(env, cal_dt or observed_dt, lat, lon, ws)
             records.append({
                 "backend": backend_name,
                 "property": prop,
@@ -427,7 +501,7 @@ def parse_properties_dict(raw, backend_name, observed_dt, env):
                 "calibration_age_seconds": ((observed_dt - cal_dt).total_seconds()
                                             if cal_dt else None),
                 "latitude": lat, "longitude": lon,
-                **e,
+                "solar_zenith_deg": solar_zenith(lat, lon, cal_dt or observed_dt),
             })
 
     return records
@@ -490,9 +564,19 @@ def _unit_key(backend, prop, qubit_a, qubit_b):
     return (backend, prop, _qubit(qubit_a), _qubit(qubit_b))
 
 
+def read_last_observed(path):
+    """Latest observed_time per backend in the existing parquet."""
+    import pyarrow.parquet as pq
+    if path is None:
+        return {}
+    df = pq.read_table(path, columns=["backend", "observed_time"], read_dictionary=["backend"]).to_pandas()
+    return {str(b): t.to_pydatetime() for b, t in df.groupby("backend", observed=True)["observed_time"].max().items()}
+
+
 def read_existing_state(path, records):
-    """Read the key columns of the existing parquet and return (prior, keys): the latest value
-    per unit key, and every (unit key, calibrated_time) whose calibrated_time occurs in `records`."""
+    """Read the key columns of the existing parquet and return (prior, keys): the latest
+    (calibrated_time, value) per unit key, and every (unit key, calibrated_time) whose
+    calibrated_time occurs in `records`."""
     import pandas as pd
     import pyarrow.parquet as pq
     prior, keys = {}, set()
@@ -508,8 +592,8 @@ def read_existing_state(path, records):
         keys.add(_unit_key(b, p, qa, qb) + (None if pd.isna(t) else t.to_pydatetime(),))
     df = df[df["calibrated_time"].notna()]
     last = df.groupby(KEY_COLS, dropna=False, observed=True, sort=False)["calibrated_time"].idxmax()
-    for b, p, qa, qb, v in df.loc[last, KEY_COLS + ["value"]].itertuples(index=False):
-        prior[_unit_key(b, p, qa, qb)] = v
+    for b, p, qa, qb, t, v in df.loc[last, KEY_COLS + ["calibrated_time", "value"]].itertuples(index=False):
+        prior[_unit_key(b, p, qa, qb)] = (t.to_pydatetime(), v)
     return prior, keys
 
 
@@ -553,24 +637,28 @@ def detect_chipwide(records):
                 records[i]["chipwide_recal_event_id"] = eid
 
 
+def new_rows(records, existing_keys):
+    """Records in poll order whose (unit key, calibrated_time) is neither in the dataset nor
+    earlier in `records`."""
+    seen, out = set(existing_keys), []
+    for r in records:
+        k = _unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"]) + (r["calibrated_time"],)
+        if k not in seen:
+            seen.add(k); out.append(r)
+    return out
+
+
 def compute_is_new(new_records, prior):
-    """Set is_new_measurement based on `prior`, the latest existing value for the same
-    (backend, property, qubit_a, qubit_b)."""
+    """Set is_new_measurement on deduplicated records in poll order: true when the unit has no
+    earlier row, or `value` is set and differs from the value of the unit's latest calibration
+    so far. `prior` maps unit key -> (calibrated_time, value) and is updated in place."""
     for r in new_records:
         k = _unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
-        pv = prior.get(k)
-        if pv is None or (r["value"] is not None and pv != r["value"]):
-            r["is_new_measurement"] = True
-        else:
-            r["is_new_measurement"] = False
-    # Within this batch, also mark first occurrence of (key, value) as new
-    seen = {}
-    for r in new_records:
-        k = _unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
-        last = seen.get(k)
-        if last is not None and last == r["value"]:
-            r["is_new_measurement"] = False
-        seen[k] = r["value"]
+        pct, pv = prior.get(k, (None, None))
+        r["is_new_measurement"] = k not in prior or (r["value"] is not None and pv != r["value"])
+        ct = r["calibrated_time"]
+        if ct is not None and (pct is None or ct > pct):
+            prior[k] = (ct, r["value"])
 
 
 # ---------- IBM connection + main ----------
@@ -588,26 +676,89 @@ def connect_ibm():
     return QiskitRuntimeService()
 
 
-def write_combined(existing_path, new_df, out_path):
+def refill(tbl, env):
+    """Fill the empty covariate cells of an Arrow table from `env`; returns (table, cells filled)."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    df = add_covariates(tbl.select(["backend", "calibrated_time", "observed_time"] + COVARIATE_COLUMNS)
+                        .to_pandas(), env)
+    n = 0
+    for c in COVARIATE_COLUMNS:
+        col = tbl.column(c).combine_chunks()
+        v = df[c].to_numpy(dtype="float64", na_value=np.nan)
+        out = pc.coalesce(col, pa.array(v, mask=np.isnan(v), type=col.type))
+        n += col.null_count - out.null_count
+        i = tbl.schema.get_field_index(c)
+        tbl = tbl.set_column(i, tbl.schema.field(i), out)
+    return tbl, n
+
+
+def write_combined(existing_path, new_df, out_path, env):
     """Write the existing rows followed by `new_df` to `out_path`, holding one row group in
-    memory at a time; returns the combined row count. The last existing row group is merged
-    with the new rows, so row groups stay at ROW_GROUP_ROWS as with a whole-frame write."""
+    memory at a time, and refill the row groups holding rows observed in the last REFILL_DAYS;
+    returns (combined row count, cells refilled). The last existing row group is merged with
+    the new rows, so row groups stay at ROW_GROUP_ROWS as with a whole-frame write."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     if existing_path is None:
         new_df.to_parquet(out_path, index=False)
-        return len(new_df)
+        return len(new_df), 0
     pf = pq.ParquetFile(existing_path)
     schema = pf.schema_arrow
     new_tbl = pa.Table.from_pandas(new_df, schema=schema, preserve_index=False)
     new_tbl = new_tbl.replace_schema_metadata(schema.metadata)
+    since = datetime.now(timezone.utc) - timedelta(days=REFILL_DAYS)
+    obs_col = schema.get_field_index("observed_time")
+
+    def recent(i):
+        st = pf.metadata.row_group(i).column(obs_col).statistics
+        if st is None or not st.has_min_max:
+            return True
+        mx = st.max if st.max.tzinfo else st.max.replace(tzinfo=timezone.utc)
+        return mx >= since
+
     last = pf.num_row_groups - 1
+    filled = 0
     with pq.ParquetWriter(out_path, schema) as w:
         for i in range(last):
-            w.write_table(pf.read_row_group(i))
+            rg = pf.read_row_group(i)
+            if recent(i):
+                rg, n = refill(rg, env); filled += n
+            w.write_table(rg)
         tail = pa.concat_tables([pf.read_row_group(last), new_tbl]) if last >= 0 else new_tbl
+        tail, n = refill(tail, env); filled += n
         w.write_table(tail, row_group_size=ROW_GROUP_ROWS)
-    return pf.metadata.num_rows + len(new_df)
+    return pf.metadata.num_rows + len(new_df), filled
+
+
+def gap_times(last_seen, now):
+    """Half-hour marks after `last_seen` (at most GAP_DAYS back) up to ten minutes before `now`."""
+    if last_seen is None:
+        return []
+    start = max(last_seen, now - timedelta(days=GAP_DAYS))
+    t = start.replace(minute=0, second=0, microsecond=0)
+    out = []
+    while t < now - timedelta(minutes=10):
+        if t > last_seen + timedelta(minutes=10):
+            out.append(t)
+        t += timedelta(minutes=30)
+    return out
+
+
+def snapshot_records(be, observed_dt, at=None):
+    """Parsed records of one BackendProperties snapshot (the live one, or the historical one
+    at `at`) with chip-wide events marked; [] when it cannot be fetched."""
+    try:
+        props_obj = be.properties(datetime=at) if at else be.properties()
+        if props_obj is None:
+            return []
+        recs = parse_properties_dict(props_obj.to_dict(), be.name, observed_dt)
+    except Exception as e:
+        log(f"  property fetch failed ({be.name} {at or 'live'}): {e}")
+        return []
+    detect_chipwide(recs)
+    return recs
 
 
 def push(path, n_new):
@@ -647,47 +798,43 @@ def main():
     log(f"  {len(backends)} backends: {[b.name for b in backends]}")
 
     observed_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    last_seen = read_last_observed(existing)
     all_records = []
     for be in backends:
-        log(f"Processing {be.name}...")
-        try:
-            props_obj = be.properties()
-            if props_obj is None:
-                log(f"  no properties for {be.name}")
-                continue
-            raw = props_obj.to_dict()
-        except Exception as e:
-            log(f"  property fetch failed: {e}")
-            continue
-        recs = parse_properties_dict(raw, be.name, observed_dt, env)
-        all_records.extend(recs)
-        log(f"  {len(recs)} records")
+        times = gap_times(last_seen.get(be.name), observed_dt)
+        log(f"Processing {be.name}: {len(times)} historical snapshot(s) since "
+            f"{last_seen.get(be.name)}, then live...")
+        prev, n = set(), 0
+        for at in times + [None]:
+            recs = snapshot_records(be, at or observed_dt, at)
+            keys = [_unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
+                    + (r["calibrated_time"],) for r in recs]
+            # rows unchanged since the previous snapshot cannot be new
+            all_records.extend(r for r, k in zip(recs, keys) if k not in prev)
+            prev = set(keys) or prev
+            n += len(recs)
+        log(f"  {n} records")
 
     if not all_records:
         log("No records extracted; exiting.")
         sys.exit(0)
 
     log(f"Total extracted: {len(all_records):,}")
-    detect_chipwide(all_records)
     prior, existing_keys = read_existing_state(existing, all_records)
-    compute_is_new(all_records, prior)
+    kept = new_rows(all_records, existing_keys)
+    compute_is_new(kept, prior)
+    log(f"After dedup vs existing: {len(kept):,} truly new rows")
 
     import pandas as pd
-    new_df = pd.DataFrame(all_records)
-    new_df = to_canonical(new_df)
-    new_df["calibrated_time"] = pd.to_datetime(new_df["calibrated_time"], utc=True)
-
-    # Dedup against existing
-    if existing is not None:
-        mask = [_unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
-                + (r["calibrated_time"],) not in existing_keys for r in all_records]
-        new_df = new_df[mask].copy()
-        log(f"After dedup vs existing: {len(new_df):,} truly new rows")
+    new_df = to_canonical(pd.DataFrame(kept, columns=CANONICAL_COLUMNS))
+    for c in ("observed_time", "calibrated_time", "snapshot_update_time"):
+        new_df[c] = pd.to_datetime(new_df[c], utc=True)
+    new_df = add_covariates(new_df, env)
 
     tmp = "/tmp/qiskit_train.parquet" if os.name != "nt" else os.path.join(
         os.environ.get("TEMP", "."), "qiskit_train.parquet")
-    total = write_combined(existing, new_df, tmp)
-    log(f"Combined dataset: {total:,} rows")
+    total, filled = write_combined(existing, new_df, tmp, env)
+    log(f"Combined dataset: {total:,} rows; {filled:,} empty covariate cells of recent rows filled")
 
     push(tmp, len(new_df))
     log("Done.")
