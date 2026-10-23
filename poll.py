@@ -445,25 +445,70 @@ def _is_ceiling(prop, value):
 
 # ---------- Existing dataset handling ----------
 
+DATA_FILE = "data/train-00000-of-00001.parquet"
+KEY_COLS = ["backend", "property", "qubit_a", "qubit_b"]
+ROW_GROUP_ROWS = 1024 * 1024
+
+
 def load_existing_dataset():
+    """Download the existing parquet and return its local path, or None to start fresh.
+    Only the file's schema is read here; rows are streamed later."""
     log("Loading existing HF dataset...")
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+    import pyarrow.parquet as pq
     try:
-        from huggingface_hub import hf_hub_download
-        path = hf_hub_download(
-            repo_id=REPO_ID, repo_type="dataset",
-            filename="data/train-00000-of-00001.parquet"
-        )
-        import pandas as pd
-        df = pd.read_parquet(path)
-        log(f"  loaded {len(df):,} rows, {len(df.columns)} cols")
-        # Coerce to new schema if needed
-        if "qubit_a" not in df.columns and "qubit" in df.columns:
-            log("  legacy 17-col schema detected; will be replaced by new-schema rows.")
-            return None
-        return df
-    except Exception as e:
-        log(f"  could not load existing dataset: {e}")
+        path = hf_hub_download(repo_id=REPO_ID, repo_type="dataset", filename=DATA_FILE)
+    except EntryNotFoundError:
+        log("  no existing dataset file; starting fresh.")
         return None
+    except Exception as e:
+        log(f"FATAL: could not download existing dataset: {e}")
+        sys.exit(1)
+    pf = pq.ParquetFile(path)
+    names = pf.schema_arrow.names
+    log(f"  found {pf.metadata.num_rows:,} rows, {len(names)} cols")
+    if "qubit_a" not in names and "qubit" in names:
+        log("  legacy 17-col schema detected; will be replaced by new-schema rows.")
+        return None
+    if names != CANONICAL_COLUMNS:
+        log(f"FATAL: existing columns differ from the canonical schema: {names}")
+        sys.exit(1)
+    return path
+
+
+def _qubit(q):
+    import pandas as pd
+    return None if q is None or pd.isna(q) else int(q)
+
+
+def _unit_key(backend, prop, qubit_a, qubit_b):
+    """(backend, property, qubit_a, qubit_b) with qubit indices as int and missing ones as None,
+    so keys read from the parquet (Int64/Float64, NA) match keys built from parsed records."""
+    return (backend, prop, _qubit(qubit_a), _qubit(qubit_b))
+
+
+def read_existing_state(path, records):
+    """Read the key columns of the existing parquet and return (prior, keys): the latest value
+    per unit key, and every (unit key, calibrated_time) whose calibrated_time occurs in `records`."""
+    import pandas as pd
+    import pyarrow.parquet as pq
+    prior, keys = {}, set()
+    if path is None:
+        return prior, keys
+    df = pq.read_table(path, columns=KEY_COLS + ["calibrated_time", "value"],
+                       read_dictionary=["backend", "property"]).to_pandas()
+    times = {r["calibrated_time"] for r in records}
+    hit = df["calibrated_time"].isin(pd.to_datetime([t for t in times if t is not None], utc=True))
+    if None in times:
+        hit |= df["calibrated_time"].isna()
+    for b, p, qa, qb, t in df.loc[hit, KEY_COLS + ["calibrated_time"]].itertuples(index=False):
+        keys.add(_unit_key(b, p, qa, qb) + (None if pd.isna(t) else t.to_pydatetime(),))
+    df = df[df["calibrated_time"].notna()]
+    last = df.groupby(KEY_COLS, dropna=False, observed=True, sort=False)["calibrated_time"].idxmax()
+    for b, p, qa, qb, v in df.loc[last, KEY_COLS + ["value"]].itertuples(index=False):
+        prior[_unit_key(b, p, qa, qb)] = v
+    return prior, keys
 
 
 CANONICAL_COLUMNS = [
@@ -506,20 +551,11 @@ def detect_chipwide(records):
                 records[i]["chipwide_recal_event_id"] = eid
 
 
-def compute_is_new(new_records, existing_df):
-    """Set is_new_measurement based on the latest existing value for the same
+def compute_is_new(new_records, prior):
+    """Set is_new_measurement based on `prior`, the latest existing value for the same
     (backend, property, qubit_a, qubit_b)."""
-    import pandas as pd
-    prior = {}
-    if existing_df is not None and len(existing_df) > 0:
-        key_cols = ["backend", "property", "qubit_a", "qubit_b"]
-        # Latest value per key
-        df = existing_df.dropna(subset=["calibrated_time"]).copy()
-        df = df.sort_values("calibrated_time")
-        for k, g in df.groupby(key_cols, dropna=False):
-            prior[k] = g.iloc[-1]["value"]
     for r in new_records:
-        k = (r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
+        k = _unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
         pv = prior.get(k)
         if pv is None or (r["value"] is not None and pv != r["value"]):
             r["is_new_measurement"] = True
@@ -528,7 +564,7 @@ def compute_is_new(new_records, existing_df):
     # Within this batch, also mark first occurrence of (key, value) as new
     seen = {}
     for r in new_records:
-        k = (r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
+        k = _unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
         last = seen.get(k)
         if last is not None and last == r["value"]:
             r["is_new_measurement"] = False
@@ -550,21 +586,39 @@ def connect_ibm():
     return QiskitRuntimeService()
 
 
-def push(combined_df):
-    import pandas as pd
+def write_combined(existing_path, new_df, out_path):
+    """Write the existing rows followed by `new_df` to `out_path`, holding one row group in
+    memory at a time; returns the combined row count. The last existing row group is merged
+    with the new rows, so row groups stay at ROW_GROUP_ROWS as with a whole-frame write."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    if existing_path is None:
+        new_df.to_parquet(out_path, index=False)
+        return len(new_df)
+    pf = pq.ParquetFile(existing_path)
+    schema = pf.schema_arrow
+    new_tbl = pa.Table.from_pandas(new_df, schema=schema, preserve_index=False)
+    new_tbl = new_tbl.replace_schema_metadata(schema.metadata)
+    last = pf.num_row_groups - 1
+    with pq.ParquetWriter(out_path, schema) as w:
+        for i in range(last):
+            w.write_table(pf.read_row_group(i))
+        tail = pa.concat_tables([pf.read_row_group(last), new_tbl]) if last >= 0 else new_tbl
+        w.write_table(tail, row_group_size=ROW_GROUP_ROWS)
+    return pf.metadata.num_rows + len(new_df)
+
+
+def push(path, n_new):
     from huggingface_hub import HfApi
-    # Save to a parquet, then upload by file (avoids dataset.push_to_hub schema issues)
-    tmp = "/tmp/qiskit_train.parquet" if os.name != "nt" else os.path.join(
-        os.environ.get("TEMP", "."), "qiskit_train.parquet")
-    combined_df.to_parquet(tmp, index=False)
-    log(f"  wrote {tmp} ({os.path.getsize(tmp):,} bytes)")
+    # Upload by file (avoids dataset.push_to_hub schema issues)
+    log(f"  wrote {path} ({os.path.getsize(path):,} bytes)")
     api = HfApi(token=os.environ.get("HF_TOKEN"))
     api.upload_file(
-        path_or_fileobj=tmp,
-        path_in_repo="data/train-00000-of-00001.parquet",
+        path_or_fileobj=path,
+        path_in_repo=DATA_FILE,
         repo_id=REPO_ID, repo_type="dataset",
         commit_message=f"poll {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}: "
-                       f"+{len(combined_df) - (0 if combined_df is None else len(combined_df))} rows",
+                       f"+{n_new} rows",
     )
     log("  uploaded to HF")
 
@@ -613,31 +667,27 @@ def main():
 
     log(f"Total extracted: {len(all_records):,}")
     detect_chipwide(all_records)
-    compute_is_new(all_records, existing)
+    prior, existing_keys = read_existing_state(existing, all_records)
+    compute_is_new(all_records, prior)
 
     import pandas as pd
     new_df = pd.DataFrame(all_records)
     new_df = to_canonical(new_df)
+    new_df["calibrated_time"] = pd.to_datetime(new_df["calibrated_time"], utc=True)
 
     # Dedup against existing
-    if existing is not None and len(existing) > 0:
-        existing = to_canonical(existing)
-        key_cols = ["backend", "property", "qubit_a", "qubit_b", "calibrated_time"]
-        # Coerce calibrated_time to datetime
-        existing["calibrated_time"] = pd.to_datetime(existing["calibrated_time"], utc=True)
-        new_df["calibrated_time"] = pd.to_datetime(new_df["calibrated_time"], utc=True)
-        existing_keys = set(map(tuple, existing[key_cols].astype(str).values.tolist()))
-        new_keys = list(map(tuple, new_df[key_cols].astype(str).values.tolist()))
-        mask = [k not in existing_keys for k in new_keys]
+    if existing is not None:
+        mask = [_unit_key(r["backend"], r["property"], r["qubit_a"], r["qubit_b"])
+                + (r["calibrated_time"],) not in existing_keys for r in all_records]
         new_df = new_df[mask].copy()
         log(f"After dedup vs existing: {len(new_df):,} truly new rows")
-        combined = pd.concat([existing, new_df], ignore_index=True)
-    else:
-        combined = new_df
 
-    log(f"Combined dataset: {len(combined):,} rows")
+    tmp = "/tmp/qiskit_train.parquet" if os.name != "nt" else os.path.join(
+        os.environ.get("TEMP", "."), "qiskit_train.parquet")
+    total = write_combined(existing, new_df, tmp)
+    log(f"Combined dataset: {total:,} rows")
 
-    push(combined)
+    push(tmp, len(new_df))
     log("Done.")
     sys.exit(0)
 
