@@ -152,10 +152,10 @@ def fetch_kp_noaa():
     if data_bytes:
         try:
             data = json.loads(data_bytes)
-            for row in data[1:]:
-                ts = parse_timestamp(row[0])
-                if ts and len(row) > 1 and row[1] is not None:
-                    try: history.append((ts, float(row[1])))
+            for row in data:
+                ts = parse_timestamp(row.get("time_tag"))
+                if ts and row.get("Kp") is not None:
+                    try: history.append((ts, float(row["Kp"])))
                     except: pass
         except Exception as e:
             log(f"    Kp parse failed: {e}")
@@ -171,10 +171,10 @@ def fetch_dst_noaa():
     if data_bytes:
         try:
             data = json.loads(data_bytes)
-            for row in data[1:]:
-                ts = parse_timestamp(row[0])
-                if ts and len(row) > 1 and row[1] is not None:
-                    try: history.append((ts, float(row[1])))
+            for row in data:
+                ts = parse_timestamp(row.get("time_tag"))
+                if ts and row.get("dst") is not None:
+                    try: history.append((ts, float(row["dst"])))
                     except: pass
         except Exception as e:
             log(f"    Dst parse failed: {e}")
@@ -184,16 +184,18 @@ def fetch_dst_noaa():
 
 def fetch_bz_noaa():
     log("  Fetching NOAA Bz...")
-    url = "https://services.swpc.noaa.gov/products/solar-wind/mag-7-day.json"
+    # Last 24 h of 1-minute L1 data, one row per spacecraft per minute; `active`
+    # marks the spacecraft SWPC uses operationally.
+    url = "https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1m.json"
     data_bytes = fetch_with_retry(url, description="Bz")
     history = []
     if data_bytes:
         try:
             data = json.loads(data_bytes)
-            for row in data[1:]:
-                ts = parse_timestamp(row[0])
-                if ts and len(row) > 3 and row[3] is not None:
-                    try: history.append((ts, float(row[3])))
+            for row in [r for r in data if r.get("active")] or data:
+                ts = parse_timestamp(row.get("time_tag"))
+                if ts and row.get("bz_gsm") is not None:
+                    try: history.append((ts, float(row["bz_gsm"])))
                     except: pass
         except Exception as e:
             log(f"    Bz parse failed: {e}")
@@ -208,7 +210,7 @@ def fetch_solar_flux_noaa():
     if data_bytes:
         try:
             data = json.loads(data_bytes)
-            f = data.get("Flux")
+            f = max(data, key=lambda r: r.get("time_tag") or "").get("flux") if data else None
             if f is not None:
                 return float(f)
         except Exception:
